@@ -136,11 +136,13 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
+    EPISODE_DECISION_DISCARD,
     init_keyboard_listener,
     is_headless,
     predict_action,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
+    wait_for_episode_save_decision,
 )
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -229,6 +231,8 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Require a keyboard decision after each episode to save or discard it.
+    prompt_episode_save: bool = False
     # Action interpolation multiplier for smoother policy control (1=off, 2=2x, 3=3x)
     # Only applies when using a policy (not teleop)
     interpolation_multiplier: int = 1
@@ -578,6 +582,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             teleop.connect()
 
         listener, events = init_keyboard_listener()
+        if cfg.prompt_episode_save and listener is None:
+            logging.warning(
+                "prompt_episode_save is enabled, but keyboard input is unavailable. Episodes will be saved automatically."
+            )
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
@@ -587,7 +595,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                next_episode_index = dataset.num_episodes + 1
+                log_say(f"Recording episode {next_episode_index}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -633,6 +642,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
                     continue
+
+                if cfg.prompt_episode_save and dataset.has_pending_frames():
+                    logging.info(
+                        "Episode %s finished. Waiting for keyboard decision: UP=save, DOWN=discard, ESC=discard and stop.",
+                        next_episode_index,
+                    )
+                    episode_decision = wait_for_episode_save_decision(events)
+                    if episode_decision == EPISODE_DECISION_DISCARD:
+                        if events["stop_recording"]:
+                            log_say("Discard episode and stop recording", cfg.play_sounds)
+                        else:
+                            log_say("Discard episode", cfg.play_sounds)
+                        dataset.clear_episode_buffer()
+                        continue
 
                 dataset.save_episode()
                 recorded_episodes += 1

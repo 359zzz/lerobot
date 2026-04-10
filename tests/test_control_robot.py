@@ -20,6 +20,7 @@ from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig, record
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.utils.control_utils import EPISODE_DECISION_DISCARD, EPISODE_DECISION_SAVE
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -121,3 +122,48 @@ def test_record_and_replay(tmp_path):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
+
+
+def test_record_prompt_discard_then_save(tmp_path):
+    class DummyListener:
+        def stop(self): ...
+
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "prompt_record",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+        prompt_episode_save=True,
+    )
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "awaiting_episode_decision": False,
+        "save_episode": False,
+        "discard_episode": False,
+    }
+
+    with (
+        patch("lerobot.scripts.lerobot_record.init_keyboard_listener", return_value=(DummyListener(), events)),
+        patch(
+            "lerobot.scripts.lerobot_record.wait_for_episode_save_decision",
+            side_effect=[EPISODE_DECISION_DISCARD, EPISODE_DECISION_SAVE],
+        ) as mock_wait_for_episode_save_decision,
+    ):
+        dataset = record(cfg)
+
+    assert mock_wait_for_episode_save_decision.call_count == 2
+    assert dataset.meta.total_episodes == dataset.num_episodes == 1
+    assert dataset.meta.total_frames == dataset.num_frames > 0

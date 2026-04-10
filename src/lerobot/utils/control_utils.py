@@ -18,6 +18,7 @@
 
 
 import logging
+import time
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -35,6 +36,9 @@ from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.robots import Robot
 from lerobot.types import PolicyAction
+
+EPISODE_DECISION_SAVE = "save"
+EPISODE_DECISION_DISCARD = "discard"
 
 
 @cache
@@ -116,13 +120,47 @@ def predict_action(
     return action
 
 
+def reset_episode_decision_state(events: dict[str, bool]) -> None:
+    """Clear the transient state used for post-episode save/discard prompts."""
+    events["awaiting_episode_decision"] = False
+    events["save_episode"] = False
+    events["discard_episode"] = False
+
+
+def wait_for_episode_save_decision(events: dict[str, bool], poll_interval_s: float = 0.05) -> str:
+    """Block until the user chooses whether to save or discard the just-recorded episode."""
+    if is_headless():
+        logging.warning(
+            "Keyboard episode confirmation requested in a headless environment. Saving the episode automatically."
+        )
+        return EPISODE_DECISION_SAVE
+
+    reset_episode_decision_state(events)
+    events["awaiting_episode_decision"] = True
+    print(
+        "Episode finished. Press UP to save, DOWN to discard and continue recording, "
+        "or ESC to discard and stop."
+    )
+
+    try:
+        while True:
+            if events["save_episode"]:
+                return EPISODE_DECISION_SAVE
+            if events["discard_episode"] or events["stop_recording"]:
+                return EPISODE_DECISION_DISCARD
+            time.sleep(poll_interval_s)
+    finally:
+        reset_episode_decision_state(events)
+
+
 def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping recording or exiting loops. It gracefully
-    handles headless environments where keyboard listening is not possible.
+    This function sets up a listener for:
+      - right / left / escape during active recording or reset loops
+      - up / down / escape while waiting for a post-episode save decision
+    It gracefully handles headless environments where keyboard listening is not possible.
 
     Returns:
         A tuple containing:
@@ -136,6 +174,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    reset_episode_decision_state(events)
 
     if is_headless():
         logging.warning(
@@ -149,6 +188,19 @@ def init_keyboard_listener():
 
     def on_press(key):
         try:
+            if events["awaiting_episode_decision"]:
+                if key == keyboard.Key.up:
+                    print("Up arrow key pressed. Saving the recorded episode...")
+                    events["save_episode"] = True
+                elif key == keyboard.Key.down:
+                    print("Down arrow key pressed. Discarding the recorded episode and continuing...")
+                    events["discard_episode"] = True
+                elif key == keyboard.Key.esc:
+                    print("Escape key pressed. Discarding the recorded episode and stopping data recording...")
+                    events["discard_episode"] = True
+                    events["stop_recording"] = True
+                return
+
             if key == keyboard.Key.right:
                 print("Right arrow key pressed. Exiting loop...")
                 events["exit_early"] = True
