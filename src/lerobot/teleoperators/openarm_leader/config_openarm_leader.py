@@ -60,6 +60,21 @@ class OpenArmLeaderConfigBase:
     # When enabled, motors have torque disabled for manual movement
     manual_control: bool = True
 
+    # Gravity compensation settings for full-size leader arms.
+    # When enabled, manual_control is superseded: arm motors stay enabled and a
+    # background loop sends MIT torque feed-forward commands so the leader feels lighter.
+    gravity_compensation: bool = False
+    gravity_compensation_urdf_path: str | None = None
+    gravity_compensation_side: str | None = None  # "left", "right", "left_arm", "right_arm", or None
+    gravity_compensation_joint_names: list[str] | None = None
+    gravity_compensation_factor: float = 0.8
+    gravity_compensation_max_torque: float = 8.0
+    gravity_compensation_frequency: float = 200.0
+    gravity_compensation_kp: float = 0.0
+    gravity_compensation_kd: float = 0.0
+    gravity_compensation_joint_signs: list[float] = field(default_factory=lambda: [1.0] * 7)
+    gravity_compensation_joint_offsets_deg: list[float] = field(default_factory=lambda: [0.0] * 7)
+
     # TODO(Steven, Pepijn): Not used ... ?
     # MIT control parameters (used when manual_control=False for torque control)
     # List of 8 values: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, joint_7, gripper]

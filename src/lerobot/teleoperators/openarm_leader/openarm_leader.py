@@ -25,6 +25,11 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..teleoperator import Teleoperator
 from .config_openarm_leader import OpenArmLeaderConfig
+from .gravity_compensation import (
+    OpenArmLeaderGravityCompensator,
+    PinocchioGravityModel,
+    default_openarm_joint_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,7 @@ class OpenArmLeader(Teleoperator):
             bitrate=self.config.can_bitrate,
             data_bitrate=self.config.can_data_bitrate if self.config.use_can_fd else None,
         )
+        self._gravity_compensator: OpenArmLeaderGravityCompensator | None = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -97,17 +103,29 @@ class OpenArmLeader(Teleoperator):
         logger.info(f"Connecting arm on {self.config.port}...")
         self.bus.connect()
 
-        # Run calibration if needed
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+        try:
+            # Run calibration if needed
+            if not self.is_calibrated and calibrate:
+                logger.info(
+                    "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+                )
+                self.calibrate()
 
-        self.configure()
+            self.configure()
 
-        if self.is_calibrated:
-            self.bus.set_zero_position()
+            if self.is_calibrated:
+                self.bus.set_zero_position()
+
+            if self.config.gravity_compensation:
+                self._start_gravity_compensation()
+        except Exception:
+            self._stop_gravity_compensation()
+            if self.bus.is_connected:
+                try:
+                    self.bus.disconnect(disable_torque=True)
+                except Exception:
+                    logger.exception("Failed to safely disconnect OpenArm leader after connect failure.")
+            raise
 
         logger.info(f"{self} connected.")
 
@@ -175,7 +193,49 @@ class OpenArmLeader(Teleoperator):
         For manual control, we disable torque so the arm can be moved by hand.
         """
 
+        if self.config.gravity_compensation:
+            self.bus.configure_motors()
+            if "gripper" in self.bus.motors:
+                self.bus.disable_torque("gripper")
+            return
+
         return self.bus.disable_torque() if self.config.manual_control else self.bus.configure_motors()
+
+    def _start_gravity_compensation(self) -> None:
+        if self.config.gravity_compensation_urdf_path is None:
+            raise ValueError(
+                "`gravity_compensation_urdf_path` is required when OpenArm leader gravity compensation is enabled."
+            )
+
+        joint_names = self.config.gravity_compensation_joint_names or default_openarm_joint_names(
+            self.config.gravity_compensation_side
+        )
+        gravity_model = PinocchioGravityModel(self.config.gravity_compensation_urdf_path, joint_names)
+        self._gravity_compensator = OpenArmLeaderGravityCompensator(
+            self.bus,
+            gravity_model,
+            factor=self.config.gravity_compensation_factor,
+            max_torque=self.config.gravity_compensation_max_torque,
+            frequency_hz=self.config.gravity_compensation_frequency,
+            kp=self.config.gravity_compensation_kp,
+            kd=self.config.gravity_compensation_kd,
+            joint_signs=self.config.gravity_compensation_joint_signs,
+            joint_offsets_deg=self.config.gravity_compensation_joint_offsets_deg,
+        )
+        self._gravity_compensator.start()
+        logger.info("OpenArm leader gravity compensation started.")
+
+    def _stop_gravity_compensation(self) -> None:
+        if self._gravity_compensator is None:
+            return
+
+        self._gravity_compensator.stop()
+        if self._gravity_compensator.is_running:
+            logger.warning("OpenArm leader gravity compensation thread did not stop before disconnect.")
+            return
+
+        logger.info("OpenArm leader gravity compensation stopped.")
+        self._gravity_compensator = None
 
     def setup_motors(self) -> None:
         raise NotImplementedError(
@@ -196,8 +256,13 @@ class OpenArmLeader(Teleoperator):
 
         action_dict: dict[str, Any] = {}
 
-        # Use sync_read_all_states to get pos/vel/torque in one go
-        states = self.bus.sync_read_all_states()
+        # The compensation loop already refreshes the CAN state; reuse its cache to avoid competing reads.
+        if self._gravity_compensator is not None and self._gravity_compensator.is_running:
+            states = self._gravity_compensator.get_latest_states()
+            if not states:
+                states = self.bus.sync_read_all_states()
+        else:
+            states = self.bus.sync_read_all_states()
         for motor in self.bus.motors:
             state = states.get(motor, {})
             action_dict[f"{motor}.pos"] = state.get("position")
@@ -216,7 +281,9 @@ class OpenArmLeader(Teleoperator):
     def disconnect(self) -> None:
         """Disconnect from teleoperator."""
 
+        self._stop_gravity_compensation()
+
         # Disconnect CAN bus
-        # For manual control, ensure torque is disabled before disconnecting
-        self.bus.disconnect(disable_torque=self.config.manual_control)
+        # For manual control or gravity compensation, ensure torque is disabled before disconnecting.
+        self.bus.disconnect(disable_torque=self.config.manual_control or self.config.gravity_compensation)
         logger.info(f"{self} disconnected.")
