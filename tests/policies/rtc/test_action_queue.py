@@ -336,6 +336,40 @@ def test_merge_with_large_delay(action_queue_rtc_enabled, sample_actions):
     assert action_queue_rtc_enabled.qsize() == 0
 
 
+def test_merge_keeps_first_chunk_when_no_actions_executed(action_queue_rtc_enabled, sample_actions):
+    """Test RTC cold start keeps the first chunk even if inference latency is high."""
+    applied_delay = action_queue_rtc_enabled.merge(
+        sample_actions["short"],
+        sample_actions["short"],
+        real_delay=100,
+        action_index_before_inference=0,
+    )
+
+    assert applied_delay == 0
+    assert action_queue_rtc_enabled.qsize() == len(sample_actions["short"])
+    assert torch.equal(action_queue_rtc_enabled.get(), sample_actions["short"][0])
+
+
+def test_merge_uses_actions_consumed_during_inference(action_queue_rtc_enabled, sample_actions):
+    """Test RTC delay compensation uses actual old actions executed during inference."""
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+
+    action_index_before_inference = action_queue_rtc_enabled.get_action_index()
+    for _ in range(5):
+        action_queue_rtc_enabled.get()
+
+    applied_delay = action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=100,
+        action_index_before_inference=action_index_before_inference,
+    )
+
+    assert applied_delay == 5
+    assert action_queue_rtc_enabled.qsize() == len(sample_actions["processed"]) - 5
+    assert torch.equal(action_queue_rtc_enabled.get(), sample_actions["processed"][5])
+
+
 # merge() with RTC disabled tests
 
 

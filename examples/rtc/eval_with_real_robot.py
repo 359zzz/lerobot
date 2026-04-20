@@ -92,10 +92,11 @@ Usage:
 
 import logging
 import math
-import sys
 import time
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass, field
+from queue import Empty, Queue
 from threading import Event, Lock, Thread
 
 import torch
@@ -160,6 +161,13 @@ class RobotWrapper:
     def action_features(self) -> list[str]:
         with self.lock:
             return self.robot.action_features
+
+
+@dataclass(frozen=True)
+class ThreadFailure:
+    thread_name: str
+    error: Exception
+    traceback_str: str
 
 
 @dataclass
@@ -277,8 +285,11 @@ def get_actions(
     policy,
     robot: RobotWrapper,
     robot_observation_processor,
+    preprocessor,
+    postprocessor,
     action_queue: ActionQueue,
     shutdown_event: Event,
+    failure_queue: Queue[ThreadFailure],
     cfg: RTCDemoConfig,
 ):
     """Thread function to request action chunks from the policy.
@@ -309,21 +320,6 @@ def get_actions(
         dataset_features = hw_to_dataset_features(observation_features_hw, "observation")
         policy_device = policy.config.device
 
-        # Load preprocessor and postprocessor from pretrained files
-        # The stats are embedded in the processor .safetensors files
-        logger.info(f"[GET_ACTIONS] Loading preprocessor/postprocessor from {cfg.policy.pretrained_path}")
-
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=cfg.policy,
-            pretrained_path=cfg.policy.pretrained_path,
-            dataset_stats=None,  # Will load from pretrained processor files
-            preprocessor_overrides={
-                "device_processor": {"device": cfg.policy.device},
-            },
-        )
-
-        logger.info("[GET_ACTIONS] Preprocessor/postprocessor loaded successfully with embedded stats")
-
         relative_step = next(
             (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
             None,
@@ -347,6 +343,18 @@ def get_actions(
 
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
+        else:
+            chunk_size = getattr(policy.config, "chunk_size", None)
+            if chunk_size is not None and get_actions_threshold >= chunk_size:
+                clamped_threshold = max(0, chunk_size - 1)
+                logger.warning(
+                    "[GET_ACTIONS] action_queue_size_to_get_new_actions=%d >= chunk_size=%d; "
+                    "clamping to %d to avoid continuous inference.",
+                    get_actions_threshold,
+                    chunk_size,
+                    clamped_threshold,
+                )
+                get_actions_threshold = clamped_threshold
 
         while not shutdown_event.is_set():
             if action_queue.qsize() <= get_actions_threshold:
@@ -430,18 +438,33 @@ def get_actions(
                         "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
                     )
 
-                action_queue.merge(
+                applied_delay = action_queue.merge(
                     original_actions, postprocessed_actions, new_delay, action_index_before_inference
                 )
+                queue_size_after_merge = action_queue.qsize()
+                logger.info(
+                    "[GET_ACTIONS] Inference latency=%.2fs, latency_delay=%d, applied_delay=%d, queue=%d",
+                    new_latency,
+                    new_delay,
+                    applied_delay,
+                    queue_size_after_merge,
+                )
+                if queue_size_after_merge == 0:
+                    logger.warning(
+                        "[GET_ACTIONS] New chunk has no executable actions after delay compensation. "
+                        "Inference is slower than the available queued horizon."
+                    )
             else:
                 # Small sleep to prevent busy waiting
                 time.sleep(0.1)
 
         logger.info("[GET_ACTIONS] get actions thread shutting down")
     except Exception as e:
+        tb = traceback.format_exc()
         logger.error(f"[GET_ACTIONS] Fatal exception in get_actions thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        logger.error(tb)
+        failure_queue.put(ThreadFailure(thread_name="GET_ACTIONS", error=e, traceback_str=tb))
+        shutdown_event.set()
 
 
 def actor_control(
@@ -449,6 +472,7 @@ def actor_control(
     robot_action_processor,
     action_queue: ActionQueue,
     shutdown_event: Event,
+    failure_queue: Queue[ThreadFailure],
     cfg: RTCDemoConfig,
 ):
     """Thread function to execute actions on the robot.
@@ -489,9 +513,85 @@ def actor_control(
 
         logger.info(f"[ACTOR] Actor thread shutting down. Total actions executed: {action_count}")
     except Exception as e:
+        tb = traceback.format_exc()
         logger.error(f"[ACTOR] Fatal exception in actor_control thread: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        logger.error(tb)
+        failure_queue.put(ThreadFailure(thread_name="ACTOR", error=e, traceback_str=tb))
+        shutdown_event.set()
+
+
+def _wait_for_initial_action_chunk(
+    action_queue: ActionQueue,
+    shutdown_event: Event,
+    failure_queue: Queue[ThreadFailure],
+    log_interval_s: float = 5.0,
+) -> ThreadFailure | None:
+    """Wait until the first policy chunk is available before starting control."""
+    logger.info("[MAIN] Waiting for initial action chunk before starting actor thread")
+    wait_start = time.monotonic()
+    last_log_time = wait_start
+
+    while not shutdown_event.is_set():
+        try:
+            return failure_queue.get_nowait()
+        except Empty:
+            pass
+
+        queue_size = action_queue.qsize()
+        if queue_size > 0:
+            logger.info(
+                "[MAIN] Initial action chunk ready after %.2fs (queue=%d)",
+                time.monotonic() - wait_start,
+                queue_size,
+            )
+            return None
+
+        now = time.monotonic()
+        if now - last_log_time >= log_interval_s:
+            logger.info(
+                "[MAIN] Still waiting for initial action chunk... elapsed=%.1fs, queue=%d",
+                now - wait_start,
+                queue_size,
+            )
+            last_log_time = now
+
+        time.sleep(0.25)
+
+    return None
+
+
+def _build_runtime_policy_config(cfg: RTCDemoConfig) -> PreTrainedConfig:
+    if cfg.policy is None:
+        raise ValueError("Policy configuration is required")
+
+    policy_cfg = deepcopy(cfg.policy)
+
+    if cfg.device is not None:
+        policy_cfg.device = cfg.device
+
+    if policy_cfg.type in {"pi05", "pi0"}:
+        policy_cfg.compile_model = cfg.use_torch_compile
+
+    return policy_cfg
+
+
+def _load_policy_processors(
+    policy_cfg: PreTrainedConfig,
+):
+    if policy_cfg.pretrained_path is None:
+        raise ValueError("Policy pretrained_path is required to load processors")
+
+    logger.info(f"Loading preprocessor/postprocessor from {policy_cfg.pretrained_path}")
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy_cfg,
+        pretrained_path=policy_cfg.pretrained_path,
+        dataset_stats=None,
+        preprocessor_overrides={
+            "device_processor": {"device": policy_cfg.device},
+        },
+    )
+    logger.info("Preprocessor/postprocessor loaded successfully with embedded stats")
+    return preprocessor, postprocessor
 
 
 def _apply_torch_compile(policy, cfg: RTCDemoConfig):
@@ -550,126 +650,185 @@ def _apply_torch_compile(policy, cfg: RTCDemoConfig):
 def demo_cli(cfg: RTCDemoConfig):
     """Main entry point for RTC demo with draccus configuration."""
 
+    runtime_policy_cfg = _build_runtime_policy_config(cfg)
+
     # Initialize logging
     init_logging()
 
-    logger.info(f"Using device: {cfg.device}")
+    logger.info(f"Using device: {runtime_policy_cfg.device}")
+    logger.info(
+        "Policy runtime config: type=%s, chunk_size=%s, n_action_steps=%s, num_inference_steps=%s, "
+        "gradient_checkpointing=%s, dtype=%s, use_relative_actions=%s",
+        runtime_policy_cfg.type,
+        getattr(runtime_policy_cfg, "chunk_size", None),
+        getattr(runtime_policy_cfg, "n_action_steps", None),
+        getattr(runtime_policy_cfg, "num_inference_steps", None),
+        getattr(runtime_policy_cfg, "gradient_checkpointing", None),
+        getattr(runtime_policy_cfg, "dtype", None),
+        getattr(runtime_policy_cfg, "use_relative_actions", None),
+    )
 
     # Setup signal handler for graceful shutdown
-    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
-    shutdown_event = signal_handler.shutdown_event
+    shutdown_event = ProcessSignalHandler(use_threads=True, display_pid=False).shutdown_event
 
     policy = None
     robot = None
+    preprocessor = None
+    postprocessor = None
     get_actions_thread = None
     actor_thread = None
+    failure_queue: Queue[ThreadFailure] | None = None
+    fatal_thread_failure: ThreadFailure | None = None
 
-    policy_class = get_policy_class(cfg.policy.type)
+    try:
+        policy_class = get_policy_class(runtime_policy_cfg.type)
 
-    # Load config and set compile_model for pi0/pi05 models
-    config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
+        if runtime_policy_cfg.use_peft:
+            from peft import PeftConfig, PeftModel
 
-    if cfg.policy.type == "pi05" or cfg.policy.type == "pi0":
-        config.compile_model = cfg.use_torch_compile
+            peft_pretrained_path = runtime_policy_cfg.pretrained_path
+            peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
 
-    if config.use_peft:
-        from peft import PeftConfig, PeftModel
+            policy = policy_class.from_pretrained(
+                pretrained_name_or_path=peft_config.base_model_name_or_path,
+                config=runtime_policy_cfg,
+            )
+            policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
+        else:
+            policy = policy_class.from_pretrained(runtime_policy_cfg.pretrained_path, config=runtime_policy_cfg)
 
-        peft_pretrained_path = cfg.policy.pretrained_path
-        peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+        # Turn on RTC
+        policy.config.rtc_config = cfg.rtc
 
-        policy = policy_class.from_pretrained(
-            pretrained_name_or_path=peft_config.base_model_name_or_path, config=config
+        # Init RTC processort, as by default if RTC disabled in the config
+        # The processor won't be created
+        policy.init_rtc_processor()
+
+        assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
+
+        policy = policy.to(runtime_policy_cfg.device)
+        policy.eval()
+
+        # Apply torch.compile to predict_action_chunk method if enabled
+        if cfg.use_torch_compile:
+            policy = _apply_torch_compile(policy, cfg)
+
+        preprocessor, postprocessor = _load_policy_processors(runtime_policy_cfg)
+
+        # Create robot
+        logger.info(f"Initializing robot: {cfg.robot.type}")
+        robot = make_robot_from_config(cfg.robot)
+        robot.connect()
+        robot_wrapper = RobotWrapper(robot)
+
+        # Create robot observation processor
+        robot_observation_processor = make_default_robot_observation_processor()
+        robot_action_processor = make_default_robot_action_processor()
+
+        # Create action queue for communication between threads
+        action_queue = ActionQueue(cfg.rtc)
+        failure_queue = Queue()
+
+        # Start chunk requester thread
+        get_actions_thread = Thread(
+            target=get_actions,
+            args=(
+                policy,
+                robot_wrapper,
+                robot_observation_processor,
+                preprocessor,
+                postprocessor,
+                action_queue,
+                shutdown_event,
+                failure_queue,
+                cfg,
+            ),
+            daemon=True,
+            name="GetActions",
         )
-        policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
-    else:
-        policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
+        get_actions_thread.start()
+        logger.info("Started get actions thread")
 
-    # Turn on RTC
-    policy.config.rtc_config = cfg.rtc
+        fatal_thread_failure = _wait_for_initial_action_chunk(
+            action_queue=action_queue,
+            shutdown_event=shutdown_event,
+            failure_queue=failure_queue,
+        )
 
-    # Init RTC processort, as by default if RTC disabled in the config
-    # The processor won't be created
-    policy.init_rtc_processor()
+        if fatal_thread_failure is None and not shutdown_event.is_set():
+            # Start action executor thread only after a chunk is ready. This prevents
+            # cold-start inference time from consuming the demo duration.
+            actor_thread = Thread(
+                target=actor_control,
+                args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, failure_queue, cfg),
+                daemon=True,
+                name="Actor",
+            )
+            actor_thread.start()
+            logger.info("Started actor thread")
 
-    assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
+            logger.info("Started stop by duration thread")
 
-    policy = policy.to(cfg.device)
-    policy.eval()
+            # Main thread monitors for duration or shutdown
+            logger.info(f"Running demo for {cfg.duration} seconds...")
+            start_time = time.monotonic()
+            last_queue_log_time = start_time
 
-    # Apply torch.compile to predict_action_chunk method if enabled
-    if cfg.use_torch_compile:
-        policy = _apply_torch_compile(policy, cfg)
+            while not shutdown_event.is_set() and (time.monotonic() - start_time) < cfg.duration:
+                if failure_queue is not None:
+                    try:
+                        fatal_thread_failure = failure_queue.get_nowait()
+                    except Empty:
+                        pass
+                    else:
+                        logger.error(
+                            f"{fatal_thread_failure.thread_name} thread failed. Stopping demo and cleaning up."
+                        )
+                        shutdown_event.set()
+                        break
 
-    # Create robot
-    logger.info(f"Initializing robot: {cfg.robot.type}")
-    robot = make_robot_from_config(cfg.robot)
-    robot.connect()
-    robot_wrapper = RobotWrapper(robot)
+                now = time.monotonic()
+                if now - last_queue_log_time >= 10:
+                    logger.info(f"[MAIN] Action queue size: {action_queue.qsize()}")
+                    last_queue_log_time = now
 
-    # Create robot observation processor
-    robot_observation_processor = make_default_robot_observation_processor()
-    robot_action_processor = make_default_robot_action_processor()
+                time.sleep(1)
 
-    # Create action queue for communication between threads
-    action_queue = ActionQueue(cfg.rtc)
+        logger.info("Demo duration reached or shutdown requested")
+    finally:
+        shutdown_event.set()
 
-    # Start chunk requester thread
-    get_actions_thread = Thread(
-        target=get_actions,
-        args=(policy, robot_wrapper, robot_observation_processor, action_queue, shutdown_event, cfg),
-        daemon=True,
-        name="GetActions",
-    )
-    get_actions_thread.start()
-    logger.info("Started get actions thread")
+        if actor_thread and actor_thread.is_alive():
+            logger.info("Waiting for action executor thread to finish...")
+            actor_thread.join(timeout=5)
+            if actor_thread.is_alive():
+                logger.warning("Actor thread did not stop within timeout; continuing cleanup.")
 
-    # Start action executor thread
-    actor_thread = Thread(
-        target=actor_control,
-        args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, cfg),
-        daemon=True,
-        name="Actor",
-    )
-    actor_thread.start()
-    logger.info("Started actor thread")
+        if get_actions_thread and get_actions_thread.is_alive():
+            logger.info("Waiting for chunk requester thread to finish...")
+            get_actions_thread.join(timeout=5)
+            if get_actions_thread.is_alive():
+                logger.warning("Chunk requester thread did not stop within timeout; continuing cleanup.")
 
-    logger.info("Started stop by duration thread")
+        if robot:
+            try:
+                robot.disconnect()
+                logger.info("Robot disconnected")
+            except Exception as e:
+                logger.warning(f"Robot disconnect failed during cleanup: {e}")
 
-    # Main thread monitors for duration or shutdown
-    logger.info(f"Running demo for {cfg.duration} seconds...")
-    start_time = time.time()
+        if fatal_thread_failure is None and failure_queue is not None:
+            try:
+                fatal_thread_failure = failure_queue.get_nowait()
+            except Empty:
+                pass
 
-    while not shutdown_event.is_set() and (time.time() - start_time) < cfg.duration:
-        time.sleep(10)
+        logger.info("Cleanup completed")
 
-        # Log queue status periodically
-        if int(time.time() - start_time) % 5 == 0:
-            logger.info(f"[MAIN] Action queue size: {action_queue.qsize()}")
-
-        if time.time() - start_time > cfg.duration:
-            break
-
-    logger.info("Demo duration reached or shutdown requested")
-
-    # Signal shutdown
-    shutdown_event.set()
-
-    # Wait for threads to finish
-    if get_actions_thread and get_actions_thread.is_alive():
-        logger.info("Waiting for chunk requester thread to finish...")
-        get_actions_thread.join()
-
-    if actor_thread and actor_thread.is_alive():
-        logger.info("Waiting for action executor thread to finish...")
-        actor_thread.join()
-
-    # Cleanup robot
-    if robot:
-        robot.disconnect()
-        logger.info("Robot disconnected")
-
-    logger.info("Cleanup completed")
+    if fatal_thread_failure is not None:
+        raise RuntimeError(
+            f"{fatal_thread_failure.thread_name} thread failed: {fatal_thread_failure.error}"
+        ) from fatal_thread_failure.error
 
 
 if __name__ == "__main__":

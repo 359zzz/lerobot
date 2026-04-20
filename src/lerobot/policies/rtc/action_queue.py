@@ -150,7 +150,7 @@ class ActionQueue:
         processed_actions: Tensor,
         real_delay: int,
         action_index_before_inference: int | None = None,
-    ):
+    ) -> int:
         """Merge new actions into the queue.
 
         This method operates differently based on RTC mode:
@@ -162,15 +162,19 @@ class ActionQueue:
             processed_actions: Post-processed actions for robot (time_steps, action_dim).
             real_delay: Number of time steps of inference delay.
             action_index_before_inference: Index before inference started, for validation.
+
+        Returns:
+            int: Delay actually applied while merging.
         """
         with self.lock:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
                 self._replace_actions_queue(original_actions, processed_actions, delay)
-                return
+                return delay
 
             self._append_actions_queue(original_actions, processed_actions)
+            return delay
 
     def _replace_actions_queue(self, original_actions: Tensor, processed_actions: Tensor, real_delay: int):
         """Replace the queue with new actions (RTC mode).
@@ -241,6 +245,6 @@ class ActionQueue:
                     indexes_diff,
                     real_delay,
                 )
-                return real_delay
+            return indexes_diff
 
         return effective_delay
