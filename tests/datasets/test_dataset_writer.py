@@ -23,7 +23,11 @@ import pytest
 import torch
 from PIL import Image
 
-from lerobot.datasets.dataset_writer import _encode_video_worker
+from lerobot.datasets.dataset_writer import (
+    _create_video_encoding_executor,
+    _encode_video_worker,
+    _should_process_encode_in_parallel,
+)
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
@@ -90,6 +94,46 @@ def test_encode_video_worker_default_vcodec(tmp_path):
         _encode_video_worker(video_key, 0, tmp_path, fps=30)
 
     assert captured_kwargs["vcodec"] == "libsvtav1"
+
+
+def test_create_video_encoding_executor_uses_spawn_context():
+    """Video encoding workers should use ``spawn`` instead of the default fork."""
+
+    sentinel_context = object()
+
+    with (
+        patch("lerobot.datasets.dataset_writer.mp.get_context", return_value=sentinel_context) as get_context,
+        patch("lerobot.datasets.dataset_writer.concurrent.futures.ProcessPoolExecutor") as pool,
+    ):
+        _create_video_encoding_executor(max_workers=3)
+
+    get_context.assert_called_once_with("spawn")
+    pool.assert_called_once_with(max_workers=3, mp_context=sentinel_context)
+
+
+def test_should_process_encode_in_parallel_disables_multicamera_libsvtav1():
+    """Multi-camera software AV1 saves should stay serial to avoid hangs."""
+
+    assert not _should_process_encode_in_parallel(
+        parallel_encoding=True,
+        num_cameras=3,
+        vcodec="libsvtav1",
+    )
+    assert _should_process_encode_in_parallel(
+        parallel_encoding=True,
+        num_cameras=3,
+        vcodec="h264",
+    )
+    assert not _should_process_encode_in_parallel(
+        parallel_encoding=False,
+        num_cameras=3,
+        vcodec="h264",
+    )
+    assert not _should_process_encode_in_parallel(
+        parallel_encoding=True,
+        num_cameras=1,
+        vcodec="h264",
+    )
 
 
 # ── add_frame contracts ──────────────────────────────────────────────

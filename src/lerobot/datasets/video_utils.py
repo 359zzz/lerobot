@@ -434,6 +434,15 @@ def encode_video_frames(
     with Image.open(input_list[0]) as dummy_image:
         width, height = dummy_image.size
 
+    logger.info(
+        "Encoding %s frame(s) from %s to %s with codec=%s at %sfps",
+        len(input_list),
+        imgs_dir,
+        video_path,
+        vcodec,
+        fps,
+    )
+
     # Define video codec options
     video_options = _get_codec_options(vcodec, g, crf, preset)
 
@@ -465,13 +474,21 @@ def encode_video_frames(
         output_stream.height = height
 
         # Loop through input frames and encode them
-        for input_data in input_list:
+        for frame_idx, input_data in enumerate(input_list, start=1):
             with Image.open(input_data) as input_image:
                 input_image = input_image.convert("RGB")
                 input_frame = av.VideoFrame.from_image(input_image)
                 packet = output_stream.encode(input_frame)
                 if packet:
                     output.mux(packet)
+
+            if frame_idx == 1 or frame_idx % 300 == 0 or frame_idx == len(input_list):
+                logger.info(
+                    "Encoding progress for %s: %s/%s frame(s)",
+                    video_path.name,
+                    frame_idx,
+                    len(input_list),
+                )
 
         # Flush the encoder
         packet = output_stream.encode()
@@ -484,6 +501,8 @@ def encode_video_frames(
 
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
+
+    logger.info("Finished writing encoded video to %s", video_path)
 
 
 def concatenate_video_files(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import logging
+import multiprocessing as mp
 import shutil
 import tempfile
 from pathlib import Path
@@ -60,6 +61,37 @@ from lerobot.datasets.video_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _create_video_encoding_executor(max_workers: int) -> concurrent.futures.ProcessPoolExecutor:
+    """Create a process pool using ``spawn`` for safer video encoding workers.
+
+    Recording sessions can keep background threads alive (for example hardware
+    feedback / gravity-compensation loops). Using the default Unix ``fork``
+    start method in that situation can deadlock child workers when they invoke
+    native encoder libraries. ``spawn`` is slower to start but much safer here.
+    """
+
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp.get_context("spawn"),
+    )
+
+
+def _should_process_encode_in_parallel(
+    parallel_encoding: bool,
+    num_cameras: int,
+    vcodec: str,
+) -> bool:
+    """Whether to use multi-process parallel encoding for this episode save.
+
+    ``libsvtav1`` already parallelizes internally. Running one software AV1
+    encoder process per camera on top of that can oversubscribe the machine and,
+    in real robot recording sessions, has proven prone to hangs. Keep that path
+    serial while preserving process-parallel encoding for lighter codecs.
+    """
+
+    return parallel_encoding and num_cameras > 1 and vcodec != "libsvtav1"
+
+
 def _encode_video_worker(
     video_key: str,
     episode_index: int,
@@ -71,10 +103,22 @@ def _encode_video_worker(
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
+    logger.info(
+        "Encoding episode %s video for %s from %s",
+        episode_index,
+        video_key,
+        img_dir,
+    )
     encode_video_frames(
         img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
     )
     shutil.rmtree(img_dir)
+    logger.info(
+        "Finished encoding episode %s video for %s to %s",
+        episode_index,
+        video_key,
+        temp_path,
+    )
     return temp_path
 
 
@@ -275,8 +319,20 @@ class DatasetWriter:
                 ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
         elif has_video_keys and not use_batched_encoding:
             num_cameras = len(self._meta.video_keys)
-            if parallel_encoding and num_cameras > 1:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
+            should_parallel_encode = _should_process_encode_in_parallel(
+                parallel_encoding=parallel_encoding,
+                num_cameras=num_cameras,
+                vcodec=self._vcodec,
+            )
+            if parallel_encoding and num_cameras > 1 and not should_parallel_encode:
+                logger.info(
+                    "Using serial video encoding for %s cameras with codec '%s'.",
+                    num_cameras,
+                    self._vcodec,
+                )
+
+            if should_parallel_encode:
+                with _create_video_encoding_executor(max_workers=num_cameras) as executor:
                     future_to_key = {
                         executor.submit(
                             _encode_video_worker,
