@@ -23,6 +23,8 @@ https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/sr
 
 import logging
 import math
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -45,6 +47,10 @@ class RTCProcessor:
         self.rtc_config = rtc_config
 
         self.tracker = None
+        self.metrics_callback: Callable[[dict[str, Any]], None] | None = None
+        self.metrics_every_n_steps = 1
+        self.metrics_context: dict[str, Any] = {}
+        self._metrics_step = 0
 
         if rtc_config.debug:
             self.tracker = Tracker(
@@ -113,6 +119,20 @@ class RTCProcessor:
 
     # ====================== End Tracker Proxy Methods ======================
 
+    def _emit_metrics(self, record: dict[str, Any]) -> None:
+        """Emit low-overhead diagnostics without synchronizing GPU tensors in this thread."""
+        if self.metrics_callback is None:
+            return
+
+        self._metrics_step += 1
+        every_n = max(1, self.metrics_every_n_steps)
+        if self._metrics_step % every_n != 0:
+            return
+
+        if self.metrics_context:
+            record = {**self.metrics_context, **record}
+        self.metrics_callback(record)
+
     def denoise_step(
         self,
         x_t,
@@ -166,6 +186,17 @@ class RTCProcessor:
         if prev_chunk_left_over is None:
             # First step, no guidance - return v_t
             v_t = original_denoise_step_partial(x_t)
+            self._emit_metrics(
+                {
+                    "event": "rtc_denoise",
+                    "guidance_applied": False,
+                    "time": time,
+                    "inference_delay": inference_delay,
+                    "execution_horizon_effective": execution_horizon,
+                    "base_velocity_norm": v_t.detach().float().norm(),
+                    "corrected_velocity_norm": v_t.detach().float().norm(),
+                }
+            )
             return v_t
 
         x_t = x_t.clone().detach()
@@ -179,6 +210,8 @@ class RTCProcessor:
         if len(prev_chunk_left_over.shape) < 3:
             # Add batch dimension
             prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+
+        prev_leftover_len = prev_chunk_left_over.shape[1]
 
         if execution_horizon is None:
             execution_horizon = self.rtc_config.execution_horizon
@@ -226,6 +259,29 @@ class RTCProcessor:
         guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
         result = v_t - guidance_weight * correction
+
+        weights_for_metrics = weights.detach().float()
+        self._emit_metrics(
+            {
+                "event": "rtc_denoise",
+                "guidance_applied": True,
+                "time": time,
+                "inference_delay": inference_delay,
+                "prev_leftover_len": prev_leftover_len,
+                "execution_horizon_effective": execution_horizon,
+                "prefix_schedule": self.rtc_config.prefix_attention_schedule.name,
+                "prefix_weights_sum": weights_for_metrics.sum(),
+                "prefix_weights_max": weights_for_metrics.max(),
+                "prefix_weights_nonzero": weights_for_metrics.ne(0).sum(),
+                "guidance_weight": guidance_weight.detach()
+                if isinstance(guidance_weight, Tensor)
+                else guidance_weight,
+                "correction_norm": correction.detach().float().norm(),
+                "base_velocity_norm": v_t.detach().float().norm(),
+                "corrected_velocity_norm": result.detach().float().norm(),
+                "err_norm": err.detach().float().norm(),
+            }
+        )
 
         # Remove the batch dimension if it was added
         if squeezed:

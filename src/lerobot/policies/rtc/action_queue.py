@@ -97,6 +97,19 @@ class ActionQueue:
         length = len(self.queue)
         return length - self.last_index
 
+    def snapshot(self) -> dict[str, int | None]:
+        """Return a thread-safe snapshot of queue state for diagnostics."""
+        with self.lock:
+            queue_len = None if self.queue is None else len(self.queue)
+            original_queue_len = None if self.original_queue is None else len(self.original_queue)
+            qsize = 0 if queue_len is None else queue_len - self.last_index
+            return {
+                "qsize": qsize,
+                "last_index": self.last_index,
+                "queue_len": queue_len,
+                "original_queue_len": original_queue_len,
+            }
+
     def empty(self) -> bool:
         """Check if the queue is empty.
 
@@ -150,7 +163,7 @@ class ActionQueue:
         processed_actions: Tensor,
         real_delay: int,
         action_index_before_inference: int | None = None,
-    ):
+    ) -> dict[str, int]:
         """Merge new actions into the queue.
 
         This method operates differently based on RTC mode:
@@ -164,15 +177,39 @@ class ActionQueue:
             action_index_before_inference: Index before inference started, for validation.
         """
         with self.lock:
+            action_index_after_inference = self.last_index
+            indexes_diff = (
+                max(0, action_index_after_inference - action_index_before_inference)
+                if action_index_before_inference is not None
+                else 0
+            )
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
-                self._replace_actions_queue(original_actions, processed_actions, delay)
-                return
+                clamped_delay = self._replace_actions_queue(original_actions, processed_actions, delay)
+            else:
+                clamped_delay = 0
+                self._append_actions_queue(original_actions, processed_actions)
 
-            self._append_actions_queue(original_actions, processed_actions)
+            queue_len = 0 if self.queue is None else len(self.queue)
+            original_queue_len = 0 if self.original_queue is None else len(self.original_queue)
+            return {
+                "action_index_after_inference": action_index_after_inference,
+                "indexes_diff": indexes_diff,
+                "real_delay": real_delay,
+                "resolved_delay": delay,
+                "clamped_delay": clamped_delay,
+                "qsize_after_merge": queue_len - self.last_index,
+                "queue_len_after_merge": queue_len,
+                "original_queue_len_after_merge": original_queue_len,
+            }
 
-    def _replace_actions_queue(self, original_actions: Tensor, processed_actions: Tensor, real_delay: int):
+    def _replace_actions_queue(
+        self,
+        original_actions: Tensor,
+        processed_actions: Tensor,
+        real_delay: int,
+    ) -> int:
         """Replace the queue with new actions (RTC mode).
 
         Discards the first `real_delay` actions since they correspond to the time
@@ -192,6 +229,7 @@ class ActionQueue:
         logger.debug(f"real_delay: {real_delay}, clamped_delay: {clamped_delay}")
 
         self.last_index = 0
+        return clamped_delay
 
     def _append_actions_queue(self, original_actions: Tensor, processed_actions: Tensor):
         """Append new actions to the queue (non-RTC mode).

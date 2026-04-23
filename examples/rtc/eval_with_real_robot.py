@@ -90,13 +90,17 @@ Usage:
         --device=cuda
 """
 
+import json
 import logging
 import math
+import queue
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Event, Lock, Thread
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -138,6 +142,93 @@ from lerobot.utils.utils import init_logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert diagnostic values to JSON in the background writer thread."""
+    if isinstance(value, Tensor):
+        tensor = value.detach()
+        if tensor.numel() == 1:
+            return float(tensor.cpu().item())
+        if tensor.numel() <= 16:
+            return tensor.cpu().flatten().tolist()
+        return {"shape": list(tensor.shape)}
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+class AsyncJsonlLogger:
+    """Single background writer so diagnostics do not block control/inference threads."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._queue: queue.SimpleQueue[dict[str, Any] | None] = queue.SimpleQueue()
+        self._closed = False
+        self._thread = Thread(target=self._run, daemon=True, name="RTCPerfLogger")
+        self._thread.start()
+
+    def log(self, record: dict[str, Any]) -> None:
+        if not self._closed:
+            self._queue.put(record)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        with self.path.open("a", encoding="utf-8", buffering=1) as f:
+            while True:
+                record = self._queue.get()
+                if record is None:
+                    break
+                payload = {"wall_time_s": time.time(), **record}
+                f.write(json.dumps(_jsonable(payload), sort_keys=True) + "\n")
+
+
+def _configure_rtc_metrics(
+    policy,
+    metrics_logger: AsyncJsonlLogger | None,
+    metrics_every_n_steps: int,
+    metrics_context: dict[str, Any],
+) -> int:
+    """Attach RTC metric callbacks to every reachable RTCProcessor instance."""
+    if metrics_logger is None:
+        return 0
+
+    configured = 0
+    seen_objects: set[int] = set()
+    seen_processors: set[int] = set()
+    stack = [policy]
+
+    while stack:
+        obj = stack.pop()
+        if obj is None or id(obj) in seen_objects:
+            continue
+        seen_objects.add(id(obj))
+
+        rtc_processor = getattr(obj, "rtc_processor", None)
+        if rtc_processor is not None and id(rtc_processor) not in seen_processors:
+            rtc_processor.metrics_callback = metrics_logger.log
+            rtc_processor.metrics_every_n_steps = max(1, metrics_every_n_steps)
+            rtc_processor.metrics_context = metrics_context
+            seen_processors.add(id(rtc_processor))
+            configured += 1
+
+        for attr in ("module", "base_model", "model"):
+            child = getattr(obj, attr, None)
+            if child is not None:
+                stack.append(child)
+
+    return configured
 
 
 class RobotWrapper:
@@ -220,6 +311,13 @@ class RTCDemoConfig(HubMixin):
         },
     )
 
+    # Optional diagnostics. When enabled, records are written as JSON lines to this file by a background
+    # thread so disk IO does not block action execution or chunk inference.
+    rtc_log_path: str | None = None
+    rtc_log_denoise_metrics: bool = True
+    rtc_log_denoise_every: int = 1
+    rtc_log_actor_summary_s: float = 1.0
+
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
         policy_path = parser.get_path_arg("policy")
@@ -280,6 +378,8 @@ def get_actions(
     action_queue: ActionQueue,
     shutdown_event: Event,
     cfg: RTCDemoConfig,
+    metrics_logger: AsyncJsonlLogger | None = None,
+    rtc_metrics_context: dict[str, Any] | None = None,
 ):
     """Thread function to request action chunks from the policy.
 
@@ -348,17 +448,26 @@ def get_actions(
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
 
+        cycle_id = 0
+        metrics_log = metrics_logger.log if metrics_logger is not None else None
+
         while not shutdown_event.is_set():
-            if action_queue.qsize() <= get_actions_threshold:
+            queue_snapshot_before = action_queue.snapshot()
+            if queue_snapshot_before["qsize"] <= get_actions_threshold:
+                cycle_id += 1
                 current_time = time.perf_counter()
-                action_index_before_inference = action_queue.get_action_index()
+                action_index_before_inference = queue_snapshot_before["last_index"]
                 prev_actions = action_queue.get_left_over()
+                prev_leftover_len = 0 if prev_actions is None else prev_actions.shape[0]
 
                 inference_latency = latency_tracker.max()
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
+                obs_start = time.perf_counter()
                 obs = robot.get_observation()
+                obs_read_s = time.perf_counter() - obs_start
 
+                obs_prepare_start = time.perf_counter()
                 # Apply robot observation processor
                 obs_processed = robot_observation_processor(obs)
 
@@ -382,23 +491,30 @@ def get_actions(
                 obs_with_policy_features["robot_type"] = (
                     robot.robot.name if hasattr(robot.robot, "name") else ""
                 )
+                obs_prepare_s = time.perf_counter() - obs_prepare_start
 
+                preprocess_start = time.perf_counter()
                 preproceseded_obs = preprocessor(obs_with_policy_features)
+                preprocess_s = time.perf_counter() - preprocess_start
 
                 # Re-anchor leftover actions for relative-action policies.
                 # We need the *postprocessed* (absolute) leftover, not the original
                 # (normalized/relative) one that get_left_over() returns.
+                reanchor_s = 0.0
+                prev_actions_abs_len = None
                 if (
                     prev_actions is not None
                     and relative_step is not None
                     and OBS_STATE in obs_with_policy_features
                 ):
+                    reanchor_start = time.perf_counter()
                     with action_queue.lock:
                         if action_queue.queue is not None:
                             prev_actions_abs = action_queue.queue[action_queue.last_index :].clone()
                         else:
                             prev_actions_abs = None
                     if prev_actions_abs is not None and prev_actions_abs.numel() > 0:
+                        prev_actions_abs_len = prev_actions_abs.shape[0]
                         prev_actions = _reanchor_relative_rtc_prefix(
                             prev_actions_absolute=prev_actions_abs,
                             current_state=obs_with_policy_features[OBS_STATE],
@@ -406,33 +522,80 @@ def get_actions(
                             normalizer_step=normalizer_step,
                             policy_device=policy_device,
                         )
+                    reanchor_s = time.perf_counter() - reanchor_start
 
                 # Generate actions WITH RTC
+                if rtc_metrics_context is not None:
+                    rtc_metrics_context.clear()
+                    rtc_metrics_context.update({"cycle_id": cycle_id})
+
+                policy_start = time.perf_counter()
                 actions = policy.predict_action_chunk(
                     preproceseded_obs,
                     inference_delay=inference_delay,
                     prev_chunk_left_over=prev_actions,
                 )
+                policy_s = time.perf_counter() - policy_start
 
                 # Store original actions (before postprocessing) for RTC
                 original_actions = actions.squeeze(0).clone()
 
+                postprocess_start = time.perf_counter()
                 postprocessed_actions = postprocessor(actions)
 
                 postprocessed_actions = postprocessed_actions.squeeze(0)
+                postprocess_s = time.perf_counter() - postprocess_start
 
+                action_index_after_inference = action_queue.get_action_index()
                 new_latency = time.perf_counter() - current_time
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
 
                 if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
                     logger.warning(
-                        "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
+                        "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions too small; "
+                        "it should be higher than inference delay + execution horizon."
                     )
 
-                action_queue.merge(
+                merge_start = time.perf_counter()
+                merge_stats = action_queue.merge(
                     original_actions, postprocessed_actions, new_delay, action_index_before_inference
                 )
+                queue_merge_s = time.perf_counter() - merge_start
+                total_s = time.perf_counter() - current_time
+
+                if metrics_log is not None:
+                    metrics_log(
+                        {
+                            "event": "get_actions_cycle",
+                            "cycle_id": cycle_id,
+                            "fps": fps,
+                            "time_per_action_s": time_per_chunk,
+                            "queue_threshold": get_actions_threshold,
+                            "qsize_before_request": queue_snapshot_before["qsize"],
+                            "queue_len_before_request": queue_snapshot_before["queue_len"],
+                            "action_index_before_inference": action_index_before_inference,
+                            "action_index_after_inference": action_index_after_inference,
+                            "indexes_diff_observed": max(
+                                0, action_index_after_inference - action_index_before_inference
+                            ),
+                            "prev_leftover_len": prev_leftover_len,
+                            "prev_actions_abs_len": prev_actions_abs_len,
+                            "inference_delay_used_steps": inference_delay,
+                            "real_delay_steps": new_delay,
+                            "chunk_size": original_actions.shape[0],
+                            "obs_read_s": obs_read_s,
+                            "obs_prepare_s": obs_prepare_s,
+                            "preprocess_s": preprocess_s,
+                            "reanchor_s": reanchor_s,
+                            "policy_s": policy_s,
+                            "postprocess_s": postprocess_s,
+                            "pre_merge_total_s": new_latency,
+                            "queue_merge_s": queue_merge_s,
+                            "total_s": total_s,
+                            **merge_stats,
+                        }
+                    )
             else:
                 # Small sleep to prevent busy waiting
                 time.sleep(0.1)
@@ -450,6 +613,7 @@ def actor_control(
     action_queue: ActionQueue,
     shutdown_event: Event,
     cfg: RTCDemoConfig,
+    metrics_logger: AsyncJsonlLogger | None = None,
 ):
     """Thread function to execute actions on the robot.
 
@@ -467,6 +631,10 @@ def actor_control(
         action_count = 0
         interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
         action_interval = interpolator.get_control_interval(cfg.fps)
+        metrics_log = metrics_logger.log if metrics_logger is not None else None
+        summary_interval_s = max(0.1, cfg.rtc_log_actor_summary_s)
+        last_summary_time = time.perf_counter()
+        last_summary_count = 0
 
         while not shutdown_event.is_set():
             start_time = time.perf_counter()
@@ -486,6 +654,28 @@ def actor_control(
 
             dt_s = time.perf_counter() - start_time
             time.sleep(max(0, (action_interval - dt_s) - 0.001))
+
+            now = time.perf_counter()
+            if metrics_log is not None and now - last_summary_time >= summary_interval_s:
+                interval_s = now - last_summary_time
+                interval_actions = action_count - last_summary_count
+                queue_snapshot = action_queue.snapshot()
+                metrics_log(
+                    {
+                        "event": "actor_summary",
+                        "actions_sent_total": action_count,
+                        "actions_sent_interval": interval_actions,
+                        "actions_sent_hz": interval_actions / interval_s if interval_s > 0 else 0.0,
+                        "target_policy_fps": cfg.fps,
+                        "target_command_hz": cfg.fps * cfg.interpolation_multiplier,
+                        "interpolation_multiplier": cfg.interpolation_multiplier,
+                        "queue_remaining": queue_snapshot["qsize"],
+                        "queue_last_index": queue_snapshot["last_index"],
+                        "queue_len": queue_snapshot["queue_len"],
+                    }
+                )
+                last_summary_time = now
+                last_summary_count = action_count
 
         logger.info(f"[ACTOR] Actor thread shutting down. Total actions executed: {action_count}")
     except Exception as e:
@@ -554,6 +744,23 @@ def demo_cli(cfg: RTCDemoConfig):
     init_logging()
 
     logger.info(f"Using device: {cfg.device}")
+    metrics_logger = AsyncJsonlLogger(cfg.rtc_log_path) if cfg.rtc_log_path else None
+    rtc_metrics_context: dict[str, Any] = {}
+    if metrics_logger is not None:
+        metrics_logger.log(
+            {
+                "event": "run_start",
+                "policy_path": cfg.policy.pretrained_path,
+                "fps": cfg.fps,
+                "interpolation_multiplier": cfg.interpolation_multiplier,
+                "action_queue_size_to_get_new_actions": cfg.action_queue_size_to_get_new_actions,
+                "rtc_enabled": cfg.rtc.enabled,
+                "rtc_execution_horizon": cfg.rtc.execution_horizon,
+                "rtc_max_guidance_weight": cfg.rtc.max_guidance_weight,
+                "rtc_prefix_attention_schedule": cfg.rtc.prefix_attention_schedule.name,
+            }
+        )
+        logger.info(f"RTC diagnostics will be written to: {metrics_logger.path}")
 
     # Setup signal handler for graceful shutdown
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
@@ -591,6 +798,14 @@ def demo_cli(cfg: RTCDemoConfig):
     # Init RTC processort, as by default if RTC disabled in the config
     # The processor won't be created
     policy.init_rtc_processor()
+    if metrics_logger is not None and cfg.rtc_log_denoise_metrics:
+        configured = _configure_rtc_metrics(
+            policy,
+            metrics_logger,
+            cfg.rtc_log_denoise_every,
+            rtc_metrics_context,
+        )
+        logger.info(f"Configured RTC denoise diagnostics on {configured} processor(s)")
 
     assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
 
@@ -617,7 +832,16 @@ def demo_cli(cfg: RTCDemoConfig):
     # Start chunk requester thread
     get_actions_thread = Thread(
         target=get_actions,
-        args=(policy, robot_wrapper, robot_observation_processor, action_queue, shutdown_event, cfg),
+        args=(
+            policy,
+            robot_wrapper,
+            robot_observation_processor,
+            action_queue,
+            shutdown_event,
+            cfg,
+            metrics_logger,
+            rtc_metrics_context,
+        ),
         daemon=True,
         name="GetActions",
     )
@@ -627,7 +851,7 @@ def demo_cli(cfg: RTCDemoConfig):
     # Start action executor thread
     actor_thread = Thread(
         target=actor_control,
-        args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, cfg),
+        args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, cfg, metrics_logger),
         daemon=True,
         name="Actor",
     )
@@ -668,6 +892,10 @@ def demo_cli(cfg: RTCDemoConfig):
     if robot:
         robot.disconnect()
         logger.info("Robot disconnected")
+
+    if metrics_logger is not None:
+        metrics_logger.log({"event": "run_end", "duration_s": time.time() - start_time})
+        metrics_logger.close()
 
     logger.info("Cleanup completed")
 
