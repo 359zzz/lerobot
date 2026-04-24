@@ -461,6 +461,7 @@ def get_actions(
                 prev_leftover_len = 0 if prev_actions is None else prev_actions.shape[0]
 
                 inference_latency = latency_tracker.max()
+                inference_latency_p95 = latency_tracker.p95()
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
                 obs_start = time.perf_counter()
@@ -574,6 +575,7 @@ def get_actions(
                             "queue_threshold": get_actions_threshold,
                             "qsize_before_request": queue_snapshot_before["qsize"],
                             "queue_len_before_request": queue_snapshot_before["queue_len"],
+                            "queue_generation_before_request": queue_snapshot_before["generation"],
                             "action_index_before_inference": action_index_before_inference,
                             "action_index_after_inference": action_index_after_inference,
                             "indexes_diff_observed": max(
@@ -581,6 +583,8 @@ def get_actions(
                             ),
                             "prev_leftover_len": prev_leftover_len,
                             "prev_actions_abs_len": prev_actions_abs_len,
+                            "latency_tracker_max_s": inference_latency,
+                            "latency_tracker_p95_s": inference_latency_p95,
                             "inference_delay_used_steps": inference_delay,
                             "real_delay_steps": new_delay,
                             "chunk_size": original_actions.shape[0],
@@ -635,14 +639,44 @@ def actor_control(
         summary_interval_s = max(0.1, cfg.rtc_log_actor_summary_s)
         last_summary_time = time.perf_counter()
         last_summary_count = 0
+        last_policy_action: Tensor | None = None
+        last_generation: int | None = None
+        policy_actions_fetched_interval = 0
+        chunk_boundary_count_interval = 0
+        policy_action_jump_l2_sum = 0.0
+        policy_action_jump_l2_count = 0
+        policy_action_jump_l2_max = 0.0
+        policy_action_jump_max_abs = 0.0
+        chunk_boundary_jump_l2_max = 0.0
+        chunk_boundary_jump_max_abs = 0.0
 
         while not shutdown_event.is_set():
             start_time = time.perf_counter()
 
             if interpolator.needs_new_action():
+                queue_snapshot_before_get = action_queue.snapshot()
                 new_action = action_queue.get()
                 if new_action is not None:
-                    interpolator.add(new_action.cpu())
+                    new_action_cpu = new_action.cpu()
+                    generation = queue_snapshot_before_get["generation"]
+                    jump_l2 = 0.0
+                    jump_max_abs = 0.0
+                    if last_policy_action is not None:
+                        jump = (new_action_cpu - last_policy_action).float()
+                        jump_l2 = float(jump.norm().item())
+                        jump_max_abs = float(jump.abs().max().item())
+                        policy_action_jump_l2_sum += jump_l2
+                        policy_action_jump_l2_count += 1
+                        policy_action_jump_l2_max = max(policy_action_jump_l2_max, jump_l2)
+                        policy_action_jump_max_abs = max(policy_action_jump_max_abs, jump_max_abs)
+                    if last_generation is not None and generation != last_generation:
+                        chunk_boundary_count_interval += 1
+                        chunk_boundary_jump_l2_max = max(chunk_boundary_jump_l2_max, jump_l2)
+                        chunk_boundary_jump_max_abs = max(chunk_boundary_jump_max_abs, jump_max_abs)
+                    last_generation = generation
+                    last_policy_action = new_action_cpu.clone()
+                    policy_actions_fetched_interval += 1
+                    interpolator.add(new_action_cpu)
 
             action = interpolator.get()
             if action is not None:
@@ -672,10 +706,30 @@ def actor_control(
                         "queue_remaining": queue_snapshot["qsize"],
                         "queue_last_index": queue_snapshot["last_index"],
                         "queue_len": queue_snapshot["queue_len"],
+                        "queue_generation": queue_snapshot["generation"],
+                        "policy_actions_fetched_interval": policy_actions_fetched_interval,
+                        "chunk_boundary_count_interval": chunk_boundary_count_interval,
+                        "policy_action_jump_l2_mean": (
+                            policy_action_jump_l2_sum / policy_action_jump_l2_count
+                            if policy_action_jump_l2_count > 0
+                            else 0.0
+                        ),
+                        "policy_action_jump_l2_max": policy_action_jump_l2_max,
+                        "policy_action_jump_max_abs": policy_action_jump_max_abs,
+                        "chunk_boundary_jump_l2_max": chunk_boundary_jump_l2_max,
+                        "chunk_boundary_jump_max_abs": chunk_boundary_jump_max_abs,
                     }
                 )
                 last_summary_time = now
                 last_summary_count = action_count
+                policy_actions_fetched_interval = 0
+                chunk_boundary_count_interval = 0
+                policy_action_jump_l2_sum = 0.0
+                policy_action_jump_l2_count = 0
+                policy_action_jump_l2_max = 0.0
+                policy_action_jump_max_abs = 0.0
+                chunk_boundary_jump_l2_max = 0.0
+                chunk_boundary_jump_max_abs = 0.0
 
         logger.info(f"[ACTOR] Actor thread shutting down. Total actions executed: {action_count}")
     except Exception as e:

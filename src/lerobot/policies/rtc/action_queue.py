@@ -62,6 +62,7 @@ class ActionQueue:
         self.original_queue = None  # Original actions for RTC
         self.lock = Lock()
         self.last_index = 0
+        self.generation = 0
         self.cfg = cfg
 
     def get(self) -> Tensor | None:
@@ -108,6 +109,7 @@ class ActionQueue:
                 "last_index": self.last_index,
                 "queue_len": queue_len,
                 "original_queue_len": original_queue_len,
+                "generation": self.generation,
             }
 
     def empty(self) -> bool:
@@ -183,6 +185,11 @@ class ActionQueue:
                 if action_index_before_inference is not None
                 else 0
             )
+            old_head_action = None
+            old_qsize = 0
+            if self.queue is not None and self.last_index < len(self.queue):
+                old_head_action = self.queue[self.last_index].clone()
+                old_qsize = len(self.queue) - self.last_index
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
@@ -193,15 +200,28 @@ class ActionQueue:
 
             queue_len = 0 if self.queue is None else len(self.queue)
             original_queue_len = 0 if self.original_queue is None else len(self.original_queue)
+            new_head_action = None if self.queue is None or len(self.queue) == 0 else self.queue[0].clone()
+            replacement_jump_l2 = None
+            replacement_jump_max_abs = None
+            if old_head_action is not None and new_head_action is not None:
+                jump = (new_head_action - old_head_action).float()
+                replacement_jump_l2 = float(jump.norm().item())
+                replacement_jump_max_abs = float(jump.abs().max().item())
             return {
                 "action_index_after_inference": action_index_after_inference,
                 "indexes_diff": indexes_diff,
                 "real_delay": real_delay,
                 "resolved_delay": delay,
                 "clamped_delay": clamped_delay,
+                "queue_generation": self.generation,
                 "qsize_after_merge": queue_len - self.last_index,
                 "queue_len_after_merge": queue_len,
                 "original_queue_len_after_merge": original_queue_len,
+                "old_qsize_before_merge": old_qsize,
+                "replacement_had_old_head": int(old_head_action is not None),
+                "replacement_had_new_head": int(new_head_action is not None),
+                "replacement_jump_l2": replacement_jump_l2,
+                "replacement_jump_max_abs": replacement_jump_max_abs,
             }
 
     def _replace_actions_queue(
@@ -228,6 +248,7 @@ class ActionQueue:
         logger.debug(f"processed_actions shape: {self.queue.shape}")
         logger.debug(f"real_delay: {real_delay}, clamped_delay: {clamped_delay}")
 
+        self.generation += 1
         self.last_index = 0
         return clamped_delay
 
@@ -252,6 +273,7 @@ class ActionQueue:
         self.queue = torch.cat([self.queue, processed_actions.clone()])
         self.queue = self.queue[self.last_index :]
 
+        self.generation += 1
         self.last_index = 0
 
     def _check_and_resolve_delays(
