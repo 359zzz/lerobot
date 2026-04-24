@@ -165,7 +165,7 @@ class ActionQueue:
         processed_actions: Tensor,
         real_delay: int,
         action_index_before_inference: int | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | float | None]:
         """Merge new actions into the queue.
 
         This method operates differently based on RTC mode:
@@ -191,9 +191,15 @@ class ActionQueue:
                 old_head_action = self.queue[self.last_index].clone()
                 old_qsize = len(self.queue) - self.last_index
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
+            raw_new_head_action = None
+            boundary_blend_steps = 0
 
             if self.cfg.enabled:
-                clamped_delay = self._replace_actions_queue(original_actions, processed_actions, delay)
+                (
+                    clamped_delay,
+                    raw_new_head_action,
+                    boundary_blend_steps,
+                ) = self._replace_actions_queue(original_actions, processed_actions, delay)
             else:
                 clamped_delay = 0
                 self._append_actions_queue(original_actions, processed_actions)
@@ -201,8 +207,14 @@ class ActionQueue:
             queue_len = 0 if self.queue is None else len(self.queue)
             original_queue_len = 0 if self.original_queue is None else len(self.original_queue)
             new_head_action = None if self.queue is None or len(self.queue) == 0 else self.queue[0].clone()
+            replacement_jump_raw_l2 = None
+            replacement_jump_raw_max_abs = None
             replacement_jump_l2 = None
             replacement_jump_max_abs = None
+            if old_head_action is not None and raw_new_head_action is not None:
+                raw_jump = (raw_new_head_action - old_head_action).float()
+                replacement_jump_raw_l2 = float(raw_jump.norm().item())
+                replacement_jump_raw_max_abs = float(raw_jump.abs().max().item())
             if old_head_action is not None and new_head_action is not None:
                 jump = (new_head_action - old_head_action).float()
                 replacement_jump_l2 = float(jump.norm().item())
@@ -218,8 +230,11 @@ class ActionQueue:
                 "queue_len_after_merge": queue_len,
                 "original_queue_len_after_merge": original_queue_len,
                 "old_qsize_before_merge": old_qsize,
+                "boundary_blend_steps": boundary_blend_steps,
                 "replacement_had_old_head": int(old_head_action is not None),
                 "replacement_had_new_head": int(new_head_action is not None),
+                "replacement_jump_raw_l2": replacement_jump_raw_l2,
+                "replacement_jump_raw_max_abs": replacement_jump_raw_max_abs,
                 "replacement_jump_l2": replacement_jump_l2,
                 "replacement_jump_max_abs": replacement_jump_max_abs,
             }
@@ -229,7 +244,7 @@ class ActionQueue:
         original_actions: Tensor,
         processed_actions: Tensor,
         real_delay: int,
-    ) -> int:
+    ) -> tuple[int, Tensor | None, int]:
         """Replace the queue with new actions (RTC mode).
 
         Discards the first `real_delay` actions since they correspond to the time
@@ -241,16 +256,34 @@ class ActionQueue:
             real_delay: Number of time steps to skip due to inference delay.
         """
         clamped_delay = max(0, min(real_delay, len(original_actions), len(processed_actions)))
-        self.original_queue = original_actions[clamped_delay:].clone()
-        self.queue = processed_actions[clamped_delay:].clone()
+        raw_new_head_action = None
+        if clamped_delay < len(processed_actions):
+            raw_new_head_action = processed_actions[clamped_delay].clone()
+
+        new_original_queue = original_actions[clamped_delay:].clone()
+        new_processed_queue = processed_actions[clamped_delay:].clone()
+        boundary_blend_steps = self._compute_boundary_blend_steps(len(new_processed_queue))
+        if boundary_blend_steps > 0:
+            new_original_queue[:boundary_blend_steps] = self._blend_queue_prefix(
+                old_prefix=self.original_queue[self.last_index : self.last_index + boundary_blend_steps],
+                new_prefix=new_original_queue[:boundary_blend_steps],
+            )
+            new_processed_queue[:boundary_blend_steps] = self._blend_queue_prefix(
+                old_prefix=self.queue[self.last_index : self.last_index + boundary_blend_steps],
+                new_prefix=new_processed_queue[:boundary_blend_steps],
+            )
+
+        self.original_queue = new_original_queue
+        self.queue = new_processed_queue
 
         logger.debug(f"original_actions shape: {self.original_queue.shape}")
         logger.debug(f"processed_actions shape: {self.queue.shape}")
         logger.debug(f"real_delay: {real_delay}, clamped_delay: {clamped_delay}")
+        logger.debug(f"boundary_blend_steps: {boundary_blend_steps}")
 
         self.generation += 1
         self.last_index = 0
-        return clamped_delay
+        return clamped_delay, raw_new_head_action, boundary_blend_steps
 
     def _append_actions_queue(self, original_actions: Tensor, processed_actions: Tensor):
         """Append new actions to the queue (non-RTC mode).
@@ -304,3 +337,30 @@ class ActionQueue:
                 return real_delay
 
         return effective_delay
+
+    def _compute_boundary_blend_steps(self, new_queue_len: int) -> int:
+        """Return how many initial RTC steps should be blended for continuity."""
+        if self.queue is None or self.last_index >= len(self.queue) or new_queue_len <= 0:
+            return 0
+        horizon = max(0, int(self.cfg.execution_horizon))
+        if horizon <= 0:
+            return 0
+        old_remaining = len(self.queue) - self.last_index
+        return min(old_remaining, new_queue_len, horizon)
+
+    @staticmethod
+    def _blend_queue_prefix(old_prefix: Tensor, new_prefix: Tensor) -> Tensor:
+        """Blend old and new chunk prefixes so the boundary changes gradually."""
+        if len(old_prefix) == 0 or len(new_prefix) == 0:
+            return new_prefix
+        if len(old_prefix) != len(new_prefix):
+            raise ValueError("old_prefix and new_prefix must have matching lengths")
+
+        if len(new_prefix) == 1:
+            alpha = torch.zeros(1, device=new_prefix.device, dtype=new_prefix.dtype)
+        else:
+            alpha = torch.linspace(0, 1, steps=len(new_prefix), device=new_prefix.device, dtype=new_prefix.dtype)
+        alpha = alpha.view(-1, *([1] * (new_prefix.ndim - 1)))
+        return torch.lerp(
+            old_prefix.to(device=new_prefix.device, dtype=new_prefix.dtype), new_prefix, alpha
+        )

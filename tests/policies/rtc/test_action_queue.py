@@ -336,6 +336,41 @@ def test_merge_with_large_delay(action_queue_rtc_enabled, sample_actions):
     assert action_queue_rtc_enabled.qsize() == 0
 
 
+def test_merge_blends_boundary_prefix_when_rtc_enabled():
+    """Test RTC queue replacement smoothly blends the boundary prefix."""
+    cfg = RTCConfig(enabled=True, execution_horizon=3, max_guidance_weight=1.0)
+    queue = ActionQueue(cfg)
+
+    first_chunk = torch.tensor([[0.0], [10.0], [20.0], [30.0], [40.0]])
+    second_chunk = torch.tensor([[100.0], [110.0], [120.0], [130.0]])
+
+    queue.merge(first_chunk, first_chunk.clone(), real_delay=0)
+    queue.get()
+    queue.get()
+
+    stats = queue.merge(second_chunk, second_chunk.clone(), real_delay=1)
+
+    torch.testing.assert_close(queue.queue, torch.tensor([[20.0], [75.0], [130.0]]))
+    torch.testing.assert_close(queue.original_queue, torch.tensor([[20.0], [75.0], [130.0]]))
+    assert stats["boundary_blend_steps"] == 3
+    assert stats["replacement_jump_raw_l2"] == pytest.approx(90.0)
+    assert stats["replacement_jump_l2"] == pytest.approx(0.0)
+
+
+def test_merge_skips_boundary_blend_without_existing_queue():
+    """Test first RTC merge does not apply boundary blending diagnostics."""
+    cfg = RTCConfig(enabled=True, execution_horizon=3, max_guidance_weight=1.0)
+    queue = ActionQueue(cfg)
+
+    chunk = torch.tensor([[1.0], [2.0], [3.0]])
+    stats = queue.merge(chunk, chunk.clone(), real_delay=1)
+
+    torch.testing.assert_close(queue.queue, torch.tensor([[2.0], [3.0]]))
+    assert stats["boundary_blend_steps"] == 0
+    assert stats["replacement_jump_raw_l2"] is None
+    assert stats["replacement_jump_l2"] is None
+
+
 # merge() with RTC disabled tests
 
 
