@@ -350,11 +350,11 @@ def test_merge_blends_boundary_prefix_when_rtc_enabled():
 
     stats = queue.merge(second_chunk, second_chunk.clone(), real_delay=1)
 
-    torch.testing.assert_close(queue.queue, torch.tensor([[20.0], [75.0], [130.0]]))
-    torch.testing.assert_close(queue.original_queue, torch.tensor([[20.0], [75.0], [130.0]]))
-    assert stats["boundary_blend_steps"] == 3
+    torch.testing.assert_close(queue.queue, torch.tensor([[65.0], [120.0], [130.0]]))
+    torch.testing.assert_close(queue.original_queue, torch.tensor([[110.0], [120.0], [130.0]]))
+    assert stats["boundary_blend_steps"] == 2
     assert stats["replacement_jump_raw_l2"] == pytest.approx(90.0)
-    assert stats["replacement_jump_l2"] == pytest.approx(0.0)
+    assert stats["replacement_jump_l2"] == pytest.approx(45.0)
 
 
 def test_merge_skips_boundary_blend_without_existing_queue():

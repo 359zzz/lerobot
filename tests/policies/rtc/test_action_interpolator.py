@@ -480,7 +480,7 @@ def test_queue_interpolator_merge_resets_queue_but_interpolator_keeps_prev():
     interp.add(first_action)
     first_from_new = interp.get()
     assert first_from_new is not None
-    assert first_from_new.item() == pytest.approx(5.0)
+    assert first_from_new.item() == pytest.approx(6.0)
 
 
 def test_queue_interpolator_reset_does_not_affect_queue():
@@ -554,8 +554,12 @@ def test_queue_interpolator_delay_skips_stale_actions():
     chunk2 = _make_chunk(10, offset=100.0)
     stats = queue.merge(chunk2, chunk2.clone(), real_delay=3, action_index_before_inference=0)
 
+    leftover = queue.get_left_over()
+    assert leftover is not None
+    torch.testing.assert_close(leftover[0], torch.tensor([103.0, 103.0]))
+
     first_action = queue.get()
     assert first_action is not None
-    torch.testing.assert_close(first_action, torch.tensor([3.0, 3.0]))
+    torch.testing.assert_close(first_action, torch.tensor([53.0, 53.0]))
     torch.testing.assert_close(queue.queue[-1], torch.tensor([109.0, 109.0]))
     assert stats["clamped_delay"] == 3

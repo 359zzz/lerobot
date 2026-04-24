@@ -30,6 +30,7 @@ from torch import Tensor
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 logger = logging.getLogger(__name__)
+MAX_BOUNDARY_BLEND_STEPS = 2
 
 
 class ActionQueue:
@@ -264,10 +265,6 @@ class ActionQueue:
         new_processed_queue = processed_actions[clamped_delay:].clone()
         boundary_blend_steps = self._compute_boundary_blend_steps(len(new_processed_queue))
         if boundary_blend_steps > 0:
-            new_original_queue[:boundary_blend_steps] = self._blend_queue_prefix(
-                old_prefix=self.original_queue[self.last_index : self.last_index + boundary_blend_steps],
-                new_prefix=new_original_queue[:boundary_blend_steps],
-            )
             new_processed_queue[:boundary_blend_steps] = self._blend_queue_prefix(
                 old_prefix=self.queue[self.last_index : self.last_index + boundary_blend_steps],
                 new_prefix=new_processed_queue[:boundary_blend_steps],
@@ -346,7 +343,7 @@ class ActionQueue:
         if horizon <= 0:
             return 0
         old_remaining = len(self.queue) - self.last_index
-        return min(old_remaining, new_queue_len, horizon)
+        return min(old_remaining, new_queue_len, horizon, MAX_BOUNDARY_BLEND_STEPS)
 
     @staticmethod
     def _blend_queue_prefix(old_prefix: Tensor, new_prefix: Tensor) -> Tensor:
@@ -356,10 +353,9 @@ class ActionQueue:
         if len(old_prefix) != len(new_prefix):
             raise ValueError("old_prefix and new_prefix must have matching lengths")
 
-        if len(new_prefix) == 1:
-            alpha = torch.zeros(1, device=new_prefix.device, dtype=new_prefix.dtype)
-        else:
-            alpha = torch.linspace(0, 1, steps=len(new_prefix), device=new_prefix.device, dtype=new_prefix.dtype)
+        alpha = torch.arange(
+            1, len(new_prefix) + 1, device=new_prefix.device, dtype=new_prefix.dtype
+        ) / len(new_prefix)
         alpha = alpha.view(-1, *([1] * (new_prefix.ndim - 1)))
         return torch.lerp(
             old_prefix.to(device=new_prefix.device, dtype=new_prefix.dtype), new_prefix, alpha
