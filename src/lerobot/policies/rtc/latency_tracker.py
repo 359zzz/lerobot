@@ -70,3 +70,12 @@ class LatencyTracker:
     def p95(self) -> float | None:
         """Return the 95th percentile latency or None if empty."""
         return self.percentile(0.95)
+
+    def delay_estimate(self, q: float = 0.95) -> float:
+        """Return a robust recent latency estimate for RTC delay alignment.
+
+        Unlike :meth:`max`, this only considers the current sliding window. That
+        keeps one cold-start spike from permanently inflating the delay used to
+        align RTC chunks.
+        """
+        return float(self.percentile(q))

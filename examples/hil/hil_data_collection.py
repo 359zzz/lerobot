@@ -417,7 +417,7 @@ def _rtc_inference_thread(
                 idx_before = queue.get_action_index()
                 prev_actions = queue.get_left_over()
 
-                latency = latency_tracker.max()
+                latency = latency_tracker.delay_estimate()
                 delay = math.ceil(latency / time_per_chunk) if latency else 0
 
                 obs_batch = build_dataset_frame(hw_features, obs, prefix="observation")

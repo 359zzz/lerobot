@@ -210,6 +210,24 @@ def test_p95_equals_percentile_95(tracker):
     assert tracker.p95() == tracker.percentile(0.95)
 
 
+def test_delay_estimate_matches_recent_p95(tracker):
+    """Test delay_estimate() uses the recent-window percentile semantics."""
+    for i in range(50):
+        tracker.add(i / 50.0)
+
+    assert tracker.delay_estimate() == tracker.p95()
+
+
+def test_delay_estimate_ignores_historical_max_after_window_slides(small_tracker):
+    """Test delay_estimate() is not pinned by an old cold-start spike."""
+    small_tracker.add(0.9)
+    for lat in [0.2, 0.3, 0.4, 0.5, 0.6]:
+        small_tracker.add(lat)
+
+    assert small_tracker.max() == 0.9
+    assert small_tracker.delay_estimate() == pytest.approx(0.58, rel=1e-3)
+
+
 # ====================== Edge Cases Tests ======================
 
 

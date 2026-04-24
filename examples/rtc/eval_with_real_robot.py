@@ -460,7 +460,10 @@ def get_actions(
                 prev_actions = action_queue.get_left_over()
                 prev_leftover_len = 0 if prev_actions is None else prev_actions.shape[0]
 
-                inference_latency = latency_tracker.max()
+                # Use a recent percentile rather than the historical max so a
+                # one-off cold-start spike does not permanently overestimate delay.
+                inference_latency = latency_tracker.delay_estimate()
+                inference_latency_max = latency_tracker.max()
                 inference_latency_p95 = latency_tracker.p95()
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
@@ -583,8 +586,9 @@ def get_actions(
                             ),
                             "prev_leftover_len": prev_leftover_len,
                             "prev_actions_abs_len": prev_actions_abs_len,
-                            "latency_tracker_max_s": inference_latency,
+                            "latency_tracker_max_s": inference_latency_max,
                             "latency_tracker_p95_s": inference_latency_p95,
+                            "latency_tracker_estimate_s": inference_latency,
                             "inference_delay_used_steps": inference_delay,
                             "real_delay_steps": new_delay,
                             "chunk_size": original_actions.shape[0],
