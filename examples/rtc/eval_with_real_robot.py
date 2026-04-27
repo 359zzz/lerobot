@@ -801,6 +801,14 @@ def demo_cli(cfg: RTCDemoConfig):
     # Initialize logging
     init_logging()
 
+    policy_config = cfg.policy
+    if policy_config is None:
+        raise ValueError("Policy configuration must be provided")
+
+    # Preserve CLI overrides parsed in RTCDemoConfig.__post_init__.
+    if policy_config.type in ["pi05", "pi0"]:
+        policy_config.compile_model = cfg.use_torch_compile
+
     logger.info(f"Using device: {cfg.device}")
     metrics_logger = AsyncJsonlLogger(cfg.rtc_log_path) if cfg.rtc_log_path else None
     rtc_metrics_context: dict[str, Any] = {}
@@ -808,7 +816,16 @@ def demo_cli(cfg: RTCDemoConfig):
         metrics_logger.log(
             {
                 "event": "run_start",
-                "policy_path": cfg.policy.pretrained_path,
+                "policy_path": policy_config.pretrained_path,
+                "policy_type": policy_config.type,
+                "policy_device": policy_config.device,
+                "policy_use_peft": policy_config.use_peft,
+                "policy_num_inference_steps": getattr(policy_config, "num_inference_steps", None),
+                "policy_dtype": getattr(policy_config, "dtype", None),
+                "policy_gradient_checkpointing": getattr(policy_config, "gradient_checkpointing", None),
+                "policy_compile_model": getattr(policy_config, "compile_model", None),
+                "policy_chunk_size": getattr(policy_config, "chunk_size", None),
+                "policy_use_relative_actions": getattr(policy_config, "use_relative_actions", None),
                 "fps": cfg.fps,
                 "interpolation_multiplier": cfg.interpolation_multiplier,
                 "action_queue_size_to_get_new_actions": cfg.action_queue_size_to_get_new_actions,
@@ -829,26 +846,20 @@ def demo_cli(cfg: RTCDemoConfig):
     get_actions_thread = None
     actor_thread = None
 
-    policy_class = get_policy_class(cfg.policy.type)
+    policy_class = get_policy_class(policy_config.type)
 
-    # Load config and set compile_model for pi0/pi05 models
-    config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
-
-    if cfg.policy.type == "pi05" or cfg.policy.type == "pi0":
-        config.compile_model = cfg.use_torch_compile
-
-    if config.use_peft:
+    if policy_config.use_peft:
         from peft import PeftConfig, PeftModel
 
-        peft_pretrained_path = cfg.policy.pretrained_path
+        peft_pretrained_path = policy_config.pretrained_path
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
 
         policy = policy_class.from_pretrained(
-            pretrained_name_or_path=peft_config.base_model_name_or_path, config=config
+            pretrained_name_or_path=peft_config.base_model_name_or_path, config=policy_config
         )
         policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
     else:
-        policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
+        policy = policy_class.from_pretrained(policy_config.pretrained_path, config=policy_config)
 
     # Turn on RTC
     policy.config.rtc_config = cfg.rtc
