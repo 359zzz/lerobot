@@ -767,6 +767,15 @@ def actor_control(
         command_action_jump_l2_count = 0
         command_action_jump_l2_max = 0.0
         command_action_jump_max_abs = 0.0
+        last_sent_action: Tensor | None = None
+        sent_action_jump_l2_sum = 0.0
+        sent_action_jump_l2_count = 0
+        sent_action_jump_l2_max = 0.0
+        sent_action_jump_max_abs = 0.0
+        command_to_sent_l2_sum = 0.0
+        command_to_sent_count = 0
+        command_to_sent_l2_max = 0.0
+        command_to_sent_max_abs = 0.0
         chunk_boundary_jump_l2_max = 0.0
         chunk_boundary_jump_max_abs = 0.0
 
@@ -812,7 +821,31 @@ def actor_control(
                 last_command_action = action.clone()
                 action_dict = {key: action[i].item() for i, key in enumerate(action_keys)}
                 action_processed = robot_action_processor((action_dict, None))
-                robot.send_action(action_processed)
+                sent_action_dict = robot.send_action(action_processed)
+                try:
+                    sent_action = torch.tensor(
+                        [float(sent_action_dict[key]) for key in action_keys],
+                        dtype=torch.float32,
+                    )
+                    command_to_sent = (sent_action - action).float()
+                    command_to_sent_l2 = float(command_to_sent.norm().item())
+                    command_to_sent_abs = float(command_to_sent.abs().max().item())
+                    command_to_sent_l2_sum += command_to_sent_l2
+                    command_to_sent_count += 1
+                    command_to_sent_l2_max = max(command_to_sent_l2_max, command_to_sent_l2)
+                    command_to_sent_max_abs = max(command_to_sent_max_abs, command_to_sent_abs)
+                    if last_sent_action is not None:
+                        sent_jump = (sent_action - last_sent_action).float()
+                        sent_jump_l2 = float(sent_jump.norm().item())
+                        sent_jump_max_abs = float(sent_jump.abs().max().item())
+                        sent_action_jump_l2_sum += sent_jump_l2
+                        sent_action_jump_l2_count += 1
+                        sent_action_jump_l2_max = max(sent_action_jump_l2_max, sent_jump_l2)
+                        sent_action_jump_max_abs = max(sent_action_jump_max_abs, sent_jump_max_abs)
+                    last_sent_action = sent_action.clone()
+                except Exception:  # noqa: BLE001
+                    # Action diagnostics must never interrupt real-time control.
+                    logger.debug("[ACTOR] Failed to compute sent-action diagnostics", exc_info=True)
                 action_count += 1
 
             dt_s = time.perf_counter() - start_time
@@ -852,6 +885,20 @@ def actor_control(
                         ),
                         "command_action_jump_l2_max": command_action_jump_l2_max,
                         "command_action_jump_max_abs": command_action_jump_max_abs,
+                        "sent_action_jump_l2_mean": (
+                            sent_action_jump_l2_sum / sent_action_jump_l2_count
+                            if sent_action_jump_l2_count > 0
+                            else 0.0
+                        ),
+                        "sent_action_jump_l2_max": sent_action_jump_l2_max,
+                        "sent_action_jump_max_abs": sent_action_jump_max_abs,
+                        "command_to_sent_l2_mean": (
+                            command_to_sent_l2_sum / command_to_sent_count
+                            if command_to_sent_count > 0
+                            else 0.0
+                        ),
+                        "command_to_sent_l2_max": command_to_sent_l2_max,
+                        "command_to_sent_max_abs": command_to_sent_max_abs,
                         "chunk_boundary_jump_l2_max": chunk_boundary_jump_l2_max,
                         "chunk_boundary_jump_max_abs": chunk_boundary_jump_max_abs,
                     }
@@ -868,6 +915,14 @@ def actor_control(
                 command_action_jump_l2_count = 0
                 command_action_jump_l2_max = 0.0
                 command_action_jump_max_abs = 0.0
+                sent_action_jump_l2_sum = 0.0
+                sent_action_jump_l2_count = 0
+                sent_action_jump_l2_max = 0.0
+                sent_action_jump_max_abs = 0.0
+                command_to_sent_l2_sum = 0.0
+                command_to_sent_count = 0
+                command_to_sent_l2_max = 0.0
+                command_to_sent_max_abs = 0.0
                 chunk_boundary_jump_l2_max = 0.0
                 chunk_boundary_jump_max_abs = 0.0
 
