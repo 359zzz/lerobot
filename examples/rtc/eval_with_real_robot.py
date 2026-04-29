@@ -371,6 +371,91 @@ def _reanchor_relative_rtc_prefix(
     return transition[TransitionKey.ACTION].to(policy_device)
 
 
+def _action_sequence_metrics(
+    prefix: str,
+    actions: Tensor,
+    *,
+    current_state: Tensor | None = None,
+    window_start: int = 0,
+    window_len: int | None = None,
+) -> dict[str, float | int]:
+    """Summarize an absolute action sequence without logging full action vectors."""
+    if actions.numel() == 0:
+        return {}
+
+    seq = actions.detach().float()
+    if seq.ndim == 3 and seq.shape[0] == 1:
+        seq = seq.squeeze(0)
+    if seq.ndim != 2 or seq.shape[0] == 0:
+        return {}
+
+    metrics: dict[str, float | int] = {
+        f"{prefix}_len": int(seq.shape[0]),
+        f"{prefix}_action_dim": int(seq.shape[1]),
+    }
+
+    if seq.shape[0] > 1:
+        diffs = seq[1:] - seq[:-1]
+        step_l2 = diffs.norm(dim=-1)
+        step_max_abs = diffs.abs().amax(dim=-1)
+        metrics.update(
+            {
+                f"{prefix}_step_l2_mean": float(step_l2.mean().item()),
+                f"{prefix}_step_l2_max": float(step_l2.max().item()),
+                f"{prefix}_step_max_abs_mean": float(step_max_abs.mean().item()),
+                f"{prefix}_step_max_abs_max": float(step_max_abs.max().item()),
+            }
+        )
+
+        displacement = seq[-1] - seq[0]
+        metrics.update(
+            {
+                f"{prefix}_displacement_l2": float(displacement.norm().item()),
+                f"{prefix}_displacement_max_abs": float(displacement.abs().max().item()),
+            }
+        )
+
+    start = max(0, min(int(window_start), seq.shape[0] - 1))
+    end = seq.shape[0] if window_len is None else max(start + 1, min(seq.shape[0], start + int(window_len)))
+    window = seq[start:end]
+    metrics.update(
+        {
+            f"{prefix}_window_start": start,
+            f"{prefix}_window_len": int(window.shape[0]),
+        }
+    )
+    if window.shape[0] > 1:
+        window_diffs = window[1:] - window[:-1]
+        window_step_l2 = window_diffs.norm(dim=-1)
+        window_step_max_abs = window_diffs.abs().amax(dim=-1)
+        window_displacement = window[-1] - window[0]
+        metrics.update(
+            {
+                f"{prefix}_window_step_l2_mean": float(window_step_l2.mean().item()),
+                f"{prefix}_window_step_l2_max": float(window_step_l2.max().item()),
+                f"{prefix}_window_step_max_abs_mean": float(window_step_max_abs.mean().item()),
+                f"{prefix}_window_step_max_abs_max": float(window_step_max_abs.max().item()),
+                f"{prefix}_window_displacement_l2": float(window_displacement.norm().item()),
+                f"{prefix}_window_displacement_max_abs": float(window_displacement.abs().max().item()),
+            }
+        )
+
+    if current_state is not None:
+        state = current_state.detach().float()
+        if state.ndim == 2 and state.shape[0] == 1:
+            state = state.squeeze(0)
+        if state.ndim == 1 and state.shape[0] == seq.shape[1]:
+            head_delta = seq[start] - state
+            metrics.update(
+                {
+                    f"{prefix}_head_to_state_l2": float(head_delta.norm().item()),
+                    f"{prefix}_head_to_state_max_abs": float(head_delta.abs().max().item()),
+                }
+            )
+
+    return metrics
+
+
 def get_actions(
     policy,
     robot: RobotWrapper,
@@ -561,6 +646,24 @@ def get_actions(
                         "it should be higher than inference delay + execution horizon."
                     )
 
+                current_state_for_metrics = obs_with_policy_features.get(OBS_STATE)
+                if isinstance(current_state_for_metrics, Tensor):
+                    current_state_for_metrics = current_state_for_metrics.squeeze(0)
+                else:
+                    current_state_for_metrics = None
+
+                likely_exec_window_len = max(
+                    1,
+                    int(postprocessed_actions.shape[0]) - int(new_delay) - int(get_actions_threshold),
+                )
+                action_sequence_metrics = _action_sequence_metrics(
+                    "post_action_chunk",
+                    postprocessed_actions,
+                    current_state=current_state_for_metrics,
+                    window_start=new_delay,
+                    window_len=likely_exec_window_len,
+                )
+
                 merge_start = time.perf_counter()
                 merge_stats = action_queue.merge(
                     original_actions, postprocessed_actions, new_delay, action_index_before_inference
@@ -601,6 +704,7 @@ def get_actions(
                             "pre_merge_total_s": new_latency,
                             "queue_merge_s": queue_merge_s,
                             "total_s": total_s,
+                            **action_sequence_metrics,
                             **merge_stats,
                         }
                     )
@@ -644,6 +748,7 @@ def actor_control(
         last_summary_time = time.perf_counter()
         last_summary_count = 0
         last_policy_action: Tensor | None = None
+        last_command_action: Tensor | None = None
         last_generation: int | None = None
         policy_actions_fetched_interval = 0
         chunk_boundary_count_interval = 0
@@ -651,6 +756,10 @@ def actor_control(
         policy_action_jump_l2_count = 0
         policy_action_jump_l2_max = 0.0
         policy_action_jump_max_abs = 0.0
+        command_action_jump_l2_sum = 0.0
+        command_action_jump_l2_count = 0
+        command_action_jump_l2_max = 0.0
+        command_action_jump_max_abs = 0.0
         chunk_boundary_jump_l2_max = 0.0
         chunk_boundary_jump_max_abs = 0.0
 
@@ -685,6 +794,15 @@ def actor_control(
             action = interpolator.get()
             if action is not None:
                 action = action.cpu()
+                if last_command_action is not None:
+                    command_jump = (action - last_command_action).float()
+                    command_jump_l2 = float(command_jump.norm().item())
+                    command_jump_max_abs = float(command_jump.abs().max().item())
+                    command_action_jump_l2_sum += command_jump_l2
+                    command_action_jump_l2_count += 1
+                    command_action_jump_l2_max = max(command_action_jump_l2_max, command_jump_l2)
+                    command_action_jump_max_abs = max(command_action_jump_max_abs, command_jump_max_abs)
+                last_command_action = action.clone()
                 action_dict = {key: action[i].item() for i, key in enumerate(action_keys)}
                 action_processed = robot_action_processor((action_dict, None))
                 robot.send_action(action_processed)
@@ -720,6 +838,13 @@ def actor_control(
                         ),
                         "policy_action_jump_l2_max": policy_action_jump_l2_max,
                         "policy_action_jump_max_abs": policy_action_jump_max_abs,
+                        "command_action_jump_l2_mean": (
+                            command_action_jump_l2_sum / command_action_jump_l2_count
+                            if command_action_jump_l2_count > 0
+                            else 0.0
+                        ),
+                        "command_action_jump_l2_max": command_action_jump_l2_max,
+                        "command_action_jump_max_abs": command_action_jump_max_abs,
                         "chunk_boundary_jump_l2_max": chunk_boundary_jump_l2_max,
                         "chunk_boundary_jump_max_abs": chunk_boundary_jump_max_abs,
                     }
@@ -732,6 +857,10 @@ def actor_control(
                 policy_action_jump_l2_count = 0
                 policy_action_jump_l2_max = 0.0
                 policy_action_jump_max_abs = 0.0
+                command_action_jump_l2_sum = 0.0
+                command_action_jump_l2_count = 0
+                command_action_jump_l2_max = 0.0
+                command_action_jump_max_abs = 0.0
                 chunk_boundary_jump_l2_max = 0.0
                 chunk_boundary_jump_max_abs = 0.0
 
