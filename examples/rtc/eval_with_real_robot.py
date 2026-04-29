@@ -383,7 +383,7 @@ def _action_sequence_metrics(
     if actions.numel() == 0:
         return {}
 
-    seq = actions.detach().float()
+    seq = actions.detach().to(device="cpu", dtype=torch.float32)
     if seq.ndim == 3 and seq.shape[0] == 1:
         seq = seq.squeeze(0)
     if seq.ndim != 2 or seq.shape[0] == 0:
@@ -441,7 +441,7 @@ def _action_sequence_metrics(
         )
 
     if current_state is not None:
-        state = current_state.detach().float()
+        state = current_state.detach().to(device="cpu", dtype=torch.float32)
         if state.ndim == 2 and state.shape[0] == 1:
             state = state.squeeze(0)
         if state.ndim == 1 and state.shape[0] == seq.shape[1]:
@@ -656,13 +656,20 @@ def get_actions(
                     1,
                     int(postprocessed_actions.shape[0]) - int(new_delay) - int(get_actions_threshold),
                 )
-                action_sequence_metrics = _action_sequence_metrics(
-                    "post_action_chunk",
-                    postprocessed_actions,
-                    current_state=current_state_for_metrics,
-                    window_start=new_delay,
-                    window_len=likely_exec_window_len,
-                )
+                try:
+                    action_sequence_metrics = _action_sequence_metrics(
+                        "post_action_chunk",
+                        postprocessed_actions,
+                        current_state=current_state_for_metrics,
+                        window_start=new_delay,
+                        window_len=likely_exec_window_len,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Diagnostics must never interrupt real-time control.
+                    logger.debug("[GET_ACTIONS] Failed to compute action sequence diagnostics", exc_info=True)
+                    action_sequence_metrics = {
+                        "post_action_chunk_metrics_error": f"{type(exc).__name__}: {exc}"
+                    }
 
                 merge_start = time.perf_counter()
                 merge_stats = action_queue.merge(
