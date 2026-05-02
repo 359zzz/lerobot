@@ -242,7 +242,7 @@ class RobotWrapper:
 
     def send_action(self, action: Tensor):
         with self.lock:
-            self.robot.send_action(action)
+            return self.robot.send_action(action)
 
     def observation_features(self) -> list[str]:
         with self.lock:
@@ -776,6 +776,7 @@ def actor_control(
         command_to_sent_count = 0
         command_to_sent_l2_max = 0.0
         command_to_sent_max_abs = 0.0
+        sent_action_diag_error_count = 0
         chunk_boundary_jump_l2_max = 0.0
         chunk_boundary_jump_max_abs = 0.0
 
@@ -845,6 +846,7 @@ def actor_control(
                     last_sent_action = sent_action.clone()
                 except Exception:  # noqa: BLE001
                     # Action diagnostics must never interrupt real-time control.
+                    sent_action_diag_error_count += 1
                     logger.debug("[ACTOR] Failed to compute sent-action diagnostics", exc_info=True)
                 action_count += 1
 
@@ -899,6 +901,8 @@ def actor_control(
                         ),
                         "command_to_sent_l2_max": command_to_sent_l2_max,
                         "command_to_sent_max_abs": command_to_sent_max_abs,
+                        "sent_action_diag_success_count": command_to_sent_count,
+                        "sent_action_diag_error_count": sent_action_diag_error_count,
                         "chunk_boundary_jump_l2_max": chunk_boundary_jump_l2_max,
                         "chunk_boundary_jump_max_abs": chunk_boundary_jump_max_abs,
                     }
@@ -923,6 +927,7 @@ def actor_control(
                 command_to_sent_count = 0
                 command_to_sent_l2_max = 0.0
                 command_to_sent_max_abs = 0.0
+                sent_action_diag_error_count = 0
                 chunk_boundary_jump_l2_max = 0.0
                 chunk_boundary_jump_max_abs = 0.0
 
