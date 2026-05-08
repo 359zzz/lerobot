@@ -432,8 +432,14 @@ class SARMEncodingProcessorStep(ProcessorStep):
             inputs = self.clip_processor(images=batch_imgs, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            # Get image embeddings
-            embeddings = self.clip_model.get_image_features(**inputs).detach().cpu()
+            # Get image embeddings. Some Transformers versions return the
+            # projected tensor here, while others return the vision model output.
+            image_features = self.clip_model.get_image_features(**inputs)
+            if not isinstance(image_features, torch.Tensor):
+                image_features = image_features.pooler_output
+                if image_features.shape[-1] == self.clip_model.visual_projection.in_features:
+                    image_features = self.clip_model.visual_projection(image_features)
+            embeddings = image_features.detach().cpu()
 
             # Handle single frame case
             if embeddings.dim() == 1:
@@ -460,7 +466,12 @@ class SARMEncodingProcessorStep(ProcessorStep):
         inputs = self.clip_processor.tokenizer([text], return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        text_embedding = self.clip_model.get_text_features(**inputs).detach().cpu()
+        text_features = self.clip_model.get_text_features(**inputs)
+        if not isinstance(text_features, torch.Tensor):
+            text_features = text_features.pooler_output
+            if text_features.shape[-1] == self.clip_model.text_projection.in_features:
+                text_features = self.clip_model.text_projection(text_features)
+        text_embedding = text_features.detach().cpu()
         text_embedding = text_embedding.expand(batch_size, -1)
 
         return text_embedding
