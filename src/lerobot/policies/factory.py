@@ -41,6 +41,7 @@ from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.policies.vlsarm.configuration_vlsarm import VLSARMConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
@@ -146,6 +147,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
         return SARMRewardModel
+    elif name == "vlsarm":
+        from lerobot.policies.vlsarm.modeling_vlsarm import VLSARMRewardModel
+
+        return VLSARMRewardModel
     elif name == "groot":
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
@@ -400,6 +405,14 @@ def make_pre_post_processors(
         from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
 
         processors = make_sarm_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
+        )
+    elif isinstance(policy_cfg, VLSARMConfig):
+        from lerobot.policies.vlsarm.processor_vlsarm import make_vlsarm_pre_post_processors
+
+        processors = make_vlsarm_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
             dataset_meta=kwargs.get("dataset_meta"),
