@@ -271,8 +271,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
+    # Reward-model style policies derive stage/progress targets from episode annotations.
+    # They need dataset_meta during preprocessing even when trained from scratch.
+    if cfg.policy.type in {"sarm", "vlsarm"}:
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if processor_pretrained_path is not None:
