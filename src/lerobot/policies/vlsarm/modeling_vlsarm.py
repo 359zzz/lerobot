@@ -182,6 +182,7 @@ class VLSARMRewardModel(PreTrainedPolicy):
 
         self.vl_model = AutoModelForImageTextToText.from_pretrained(config.vl_model_name, **vl_kwargs)
         self.vl_processor = AutoProcessor.from_pretrained(config.vl_model_name, trust_remote_code=config.trust_remote_code)
+        self.vl_image_token_ids = self._infer_vl_image_token_ids()
 
         self.vl_hidden_size = self._infer_vl_hidden_size()
         self.head = TemporalStageProgressHead(config=config, vl_hidden_size=self.vl_hidden_size)
@@ -216,6 +217,32 @@ class VLSARMRewardModel(PreTrainedPolicy):
         self.vl_model.eval()
         for param in self.vl_model.parameters():
             param.requires_grad = False
+
+    def _infer_vl_image_token_ids(self) -> tuple[int, ...]:
+        token_ids: list[int] = []
+        for obj in (
+            getattr(self, "vl_model", None),
+            getattr(getattr(self, "vl_model", None), "config", None),
+            getattr(self, "vl_processor", None),
+            getattr(getattr(self, "vl_processor", None), "tokenizer", None),
+        ):
+            token_id = getattr(obj, "image_token_id", None)
+            if isinstance(token_id, int):
+                token_ids.append(token_id)
+
+        tokenizer = getattr(self.vl_processor, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "convert_tokens_to_ids"):
+            image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            if isinstance(image_token_id, int) and image_token_id >= 0:
+                token_ids.append(image_token_id)
+
+        unique_ids = tuple(sorted({token_id for token_id in token_ids if token_id >= 0}))
+        if not unique_ids:
+            logging.warning(
+                "Unable to infer VL image token ids for %s; falling back to last-token pooling.",
+                self.config.vl_model_name,
+            )
+        return unique_ids
 
     def _load_temporal_proportions(self, dataset_meta) -> None:
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
@@ -356,6 +383,48 @@ class VLSARMRewardModel(PreTrainedPolicy):
             return outputs[0]
         raise ValueError("VL model output does not expose hidden states")
 
+    def _pool_last_valid_token(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=hidden_states.device)
+        last_indices = attention_mask.sum(dim=1).clamp_min(1) - 1
+        return hidden_states[torch.arange(hidden_states.shape[0], device=hidden_states.device), last_indices]
+
+    def _build_image_token_mask(self, model_inputs: dict[str, Any]) -> torch.Tensor | None:
+        input_ids = model_inputs.get("input_ids")
+        if input_ids is None or not self.vl_image_token_ids:
+            return None
+
+        image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in self.vl_image_token_ids:
+            image_mask |= input_ids == token_id
+
+        attention_mask = model_inputs.get("attention_mask")
+        if attention_mask is not None:
+            image_mask &= attention_mask.to(torch.bool)
+
+        return image_mask
+
+    def _pool_visual_tokens(self, hidden_states: torch.Tensor, model_inputs: dict[str, Any]) -> torch.Tensor:
+        image_mask = self._build_image_token_mask(model_inputs)
+        attention_mask = model_inputs.get("attention_mask")
+        fallback = self._pool_last_valid_token(hidden_states, attention_mask=attention_mask)
+        if image_mask is None:
+            return fallback
+
+        token_counts = image_mask.sum(dim=1)
+        if torch.all(token_counts == 0):
+            return fallback
+
+        pooled = fallback.clone()
+        has_image_tokens = token_counts > 0
+        masked_hidden = hidden_states[has_image_tokens] * image_mask[has_image_tokens].unsqueeze(-1).to(hidden_states.dtype)
+        pooled[has_image_tokens] = masked_hidden.sum(dim=1) / token_counts[has_image_tokens].unsqueeze(-1).to(
+            hidden_states.dtype
+        )
+        return pooled
+
     def _encode_frames(self, frame_images: torch.Tensor | np.ndarray, task_texts: list[str]) -> torch.Tensor:
         if isinstance(frame_images, np.ndarray):
             frame_images = torch.from_numpy(frame_images)
@@ -388,11 +457,7 @@ class VLSARMRewardModel(PreTrainedPolicy):
                 )
 
             hidden_states = self._extract_sequence_features(outputs)
-            attention_mask = model_inputs.get("attention_mask")
-            if attention_mask is None:
-                attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=hidden_states.device)
-            last_indices = attention_mask.sum(dim=1).clamp_min(1) - 1
-            pooled = hidden_states[torch.arange(hidden_states.shape[0], device=hidden_states.device), last_indices]
+            pooled = self._pool_visual_tokens(hidden_states, model_inputs)
             encoded_chunks.append(pooled)
 
         frame_features = torch.cat(encoded_chunks, dim=0)
