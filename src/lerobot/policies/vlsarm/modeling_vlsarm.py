@@ -279,6 +279,7 @@ class VLSARMRewardModel(PreTrainedPolicy):
             prompt = self._build_prompt(task_texts[b_idx])
             for t_idx in range(seq_len):
                 image = self._frame_to_pil(frame_images[b_idx, t_idx])
+                text = prompt
                 if hasattr(self.vl_processor, "apply_chat_template"):
                     messages = [
                         {
@@ -296,9 +297,14 @@ class VLSARMRewardModel(PreTrainedPolicy):
                             add_generation_prompt=True,
                         )
                     except TypeError:
-                        text = self.vl_processor.apply_chat_template(messages, tokenize=False)
-                else:
-                    text = prompt
+                        try:
+                            text = self.vl_processor.apply_chat_template(messages, tokenize=False)
+                        except ValueError as exc:
+                            if "chat template" not in str(exc).lower():
+                                raise
+                    except ValueError as exc:
+                        if "chat template" not in str(exc).lower():
+                            raise
                 texts.append(text)
                 images.append(image)
 
