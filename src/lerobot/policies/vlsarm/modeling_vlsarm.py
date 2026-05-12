@@ -367,14 +367,15 @@ class VLSARMRewardModel(PreTrainedPolicy):
 
         for start in range(0, total_frames, self.config.vl_batch_size):
             stop = min(start + self.config.vl_batch_size, total_frames)
-            model_inputs = self.vl_processor(
-                text=texts[start:stop],
-                images=images[start:stop],
-                padding=True,
-                truncation=True,
-                max_length=self.config.max_prompt_length,
-                return_tensors="pt",
-            )
+            processor_kwargs = {
+                "text": texts[start:stop],
+                "images": images[start:stop],
+                "padding": True,
+                "return_tensors": "pt",
+            }
+            if self.config.max_prompt_length is not None and self.config.max_prompt_length > 0:
+                processor_kwargs["max_length"] = self.config.max_prompt_length
+            model_inputs = self.vl_processor(**processor_kwargs)
             model_inputs = self._move_vl_inputs_to_device(dict(model_inputs))
 
             context_manager = torch.no_grad if self.config.freeze_vl_backbone else nullcontext
@@ -505,6 +506,7 @@ class VLSARMRewardModel(PreTrainedPolicy):
         frame_is_rewind: torch.Tensor,
     ) -> torch.Tensor:
         frame_features = self._encode_frames(frame_images, task_texts)
+        state_features = pad_state_to_max_dim(state_features.float(), self.config.max_state_dim)
         return self.head.forward_trunk(
             frame_features=frame_features.to(self.runtime_device),
             state_features=state_features.to(self.runtime_device),
