@@ -265,6 +265,59 @@ class VLSARMRewardModel(PreTrainedPolicy):
         task_text = task_text.strip() if task_text else "unspecified task"
         return self.config.frame_prompt_template.format(task=task_text)
 
+    def _manual_multimodal_prompt(self, prompt: str) -> str:
+        # Qwen3.5 expects one image placeholder token sequence per image.
+        image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+        return f"<|im_start|>user\n{image_placeholder}\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    def _apply_chat_template_if_available(self, image: Image.Image, prompt: str) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        if hasattr(self.vl_processor, "apply_chat_template"):
+            try:
+                return self.vl_processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except TypeError:
+                try:
+                    return self.vl_processor.apply_chat_template(messages, tokenize=False)
+                except ValueError as exc:
+                    if "chat template" not in str(exc).lower():
+                        raise
+            except ValueError as exc:
+                if "chat template" not in str(exc).lower():
+                    raise
+
+        tokenizer = getattr(self.vl_processor, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except TypeError:
+                try:
+                    return tokenizer.apply_chat_template(messages, tokenize=False)
+                except ValueError as exc:
+                    if "chat template" not in str(exc).lower():
+                        raise
+            except ValueError as exc:
+                if "chat template" not in str(exc).lower():
+                    raise
+
+        return self._manual_multimodal_prompt(prompt)
+
     def _build_text_and_images(
         self, frame_images: torch.Tensor | np.ndarray, task_texts: list[str]
     ) -> tuple[list[str], list[Image.Image]]:
@@ -279,32 +332,7 @@ class VLSARMRewardModel(PreTrainedPolicy):
             prompt = self._build_prompt(task_texts[b_idx])
             for t_idx in range(seq_len):
                 image = self._frame_to_pil(frame_images[b_idx, t_idx])
-                text = prompt
-                if hasattr(self.vl_processor, "apply_chat_template"):
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image},
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ]
-                    try:
-                        text = self.vl_processor.apply_chat_template(
-                            messages,
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
-                    except TypeError:
-                        try:
-                            text = self.vl_processor.apply_chat_template(messages, tokenize=False)
-                        except ValueError as exc:
-                            if "chat template" not in str(exc).lower():
-                                raise
-                    except ValueError as exc:
-                        if "chat template" not in str(exc).lower():
-                            raise
+                text = self._apply_chat_template_if_available(image=image, prompt=prompt)
                 texts.append(text)
                 images.append(image)
 
